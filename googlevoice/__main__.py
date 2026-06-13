@@ -1,203 +1,156 @@
 """
-Googlevoice interactive application. Invoke with python -m googlevoice.
+Command-line interface for googlevoice.  Invoke with ``python -m googlevoice``.
+
+    python -m googlevoice login                # one-time browser sign-in
+    python -m googlevoice check                # is the saved session still valid?
+    python -m googlevoice number               # print your Google Voice number
+    python -m googlevoice inbox [-n N]         # list recent conversations
+    python -m googlevoice thread NUMBER [-n N] # show up to N messages with NUMBER
+    python -m googlevoice send NUMBER TEXT     # send an SMS (drives a browser)
+
+Add ``--json`` to ``number``/``inbox``/``thread`` for machine-readable output.
+Numbers may be given formatted or bare (e.g. ``2085551234``); a missing country
+code defaults to +1. If the saved session is missing or expired, a command
+offers to sign in (via the browser) and then retries automatically.
 """
 
-import functools
-from atexit import register
-from optparse import OptionParser
-from pprint import pprint
-from sys import exit
+import argparse
+import json
 
-from googlevoice.util import LoginError
-from googlevoice.voice import Voice
-
-parser = OptionParser(
-    usage='''gvoice [options] commands
-    Where commands are
-
-    login (li) - log into the voice service
-    logout (lo) - log out of the service and make sure session is deleted
-    help
-
-    Voice Commands
-        call (c) - call an outgoing number from a forwarding number
-        cancel (cc) - cancel a particular call
-        download (d) - download mp3 message given id hash
-        send_sms (s) - send sms messages
-
-    Folder Views
-        search (se)
-        inbox (i)
-        voicemail (v)
-        starred (st)
-        all (a)
-        spam (sp)
-        trash (t)
-        voicemail (v)
-        sms (sm)
-        recorded (r)
-        placed (p)
-        received (re)
-        missed (m)'''
-)
-parser.add_option(
-    "-e", "--email", dest="email", default=None, help="Google Voice Account Email"
-)
-parser.add_option(
-    "-p",
-    "--password",
-    dest='passwd',
-    default=None,
-    help='Your account password (prompted if blank)',
-)
-parser.add_option(
-    "-b",
-    "--batch",
-    dest='batch',
-    default=False,
-    action="store_true",
-    help='Batch operations, asking for no interactive input',
-)
+from . import auth, util
+from .voice import Voice
 
 
-def login(email, passwd, batch):
-    """
-    Login Voice instance based on options and interactivity
-    """
-    global voice
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog='python -m googlevoice', description=__doc__)
+    sub = parser.add_subparsers(dest='cmd', required=True)
+
+    sub.add_parser('login', help='Sign in via browser and save a portable session')
+    sub.add_parser('check', help='Check whether the saved session still works')
+
+    p_number = sub.add_parser('number', help='Print your Google Voice number')
+    p_number.add_argument('--json', action='store_true', help='machine-readable output')
+
+    p_inbox = sub.add_parser('inbox', help='List recent conversations')
+    p_inbox.add_argument(
+        '-n',
+        '--count',
+        type=int,
+        default=20,
+        help='how many conversations (default 20)',
+    )
+    p_inbox.add_argument('--json', action='store_true', help='machine-readable output')
+
+    p_thread = sub.add_parser('thread', help='Show the conversation with a number')
+    p_thread.add_argument('number', help='The other party, e.g. +12085551234')
+    p_thread.add_argument(
+        '-n',
+        '--count',
+        type=int,
+        default=50,
+        help='show up to N recent messages (default 50)',
+    )
+    p_thread.add_argument('--json', action='store_true', help='machine-readable output')
+
+    p_send = sub.add_parser('send', help='Send an SMS (launches a browser)')
+    p_send.add_argument('number', help='Recipient, e.g. +12085551234')
+    p_send.add_argument('text', nargs='+', help='Message text')
+
+    return parser
+
+
+def _confirm(question: str) -> bool:
     try:
-        voice.login(email, passwd)
-    except LoginError:
-        if batch:
-            print('Login failed.')
-            exit(0)
-        if input('Login failed. Retry?[Y/n] ').lower() in ('', 'y'):
-            login(None, None, batch)
+        return input(f'{question} [Y/n] ').strip().lower() in ('', 'y', 'yes')
+    except EOFError:
+        return False
+
+
+def _cmd_number(args) -> None:
+    number = Voice().number
+    print(json.dumps({'number': number}) if args.json else number)
+
+
+def _cmd_inbox(args) -> None:
+    threads = Voice().inbox(count=args.count)
+    if args.json:
+        print(json.dumps([t.as_dict() for t in threads], indent=2))
+        return
+    for thread in threads:
+        flag = ' ' if thread.read else '*'
+        print(f'{flag} {thread.contact}: {thread.latest_text!r}')
+
+
+def _cmd_thread(args) -> None:
+    thread = Voice().thread(args.number, messages=args.count)
+    if thread is None:
+        print(
+            'null'
+            if args.json
+            else f'No conversation with {args.number} in recent threads.'
+        )
+        raise SystemExit(1)
+    if args.json:
+        print(json.dumps(thread.as_dict(), indent=2))
+        return
+    for msg in reversed(thread.messages):  # oldest first
+        arrow = '<-' if msg.incoming else '->'
+        # local time, matching the Google Voice web UI
+        when = (
+            msg.start_time.astimezone().strftime('%Y-%m-%d %H:%M')
+            if msg.start_time
+            else '?'
+        )
+        print(f'[{when}] {arrow} {msg.text!r}')
+
+
+def _cmd_send(args) -> None:
+    from .browser import BrowserSender
+
+    with BrowserSender() as sender:
+        sender.send_sms(args.number, ' '.join(args.text))
+    print('Sent.')
+
+
+_COMMANDS = {
+    'number': _cmd_number,
+    'inbox': _cmd_inbox,
+    'thread': _cmd_thread,
+    'send': _cmd_send,
+}
+
+
+def _run(args) -> None:
+    """Run a session-backed command (may raise on a missing/expired session)."""
+    _COMMANDS[args.cmd](args)
+
+
+def main(argv=None) -> None:
+    args = _build_parser().parse_args(argv)
+
+    if args.cmd == 'login':
+        auth.browser_login()
+        print('Done. The session is ready to use from any machine.')
+        return
+
+    if args.cmd == 'check':
+        try:
+            ok = auth.session_is_valid(auth.load_session())
+        except auth.AuthError:
+            ok = False
+        print('Session is VALID.' if ok else 'Session is INVALID or missing.')
+        raise SystemExit(0 if ok else 1)
+
+    try:
+        _run(args)
+    except (auth.AuthError, util.LoginError) as err:
+        print(f'\n{err}\n')
+        if _confirm('Sign in with a browser now and retry?'):
+            auth.browser_login()
+            _run(args)
         else:
-            exit(0)
+            raise SystemExit(1) from None
 
 
-def logout():
-    global voice
-    print('Logging out of voice...')
-    voice.logout()
-
-
-def pprint_folder(name):
-    folder = getattr(voice, name)()
-    print(folder)
-    pprint(folder.messages, indent=4)
-
-
-def run_interactive(voice, action, args):
-    while 1:
-        try:
-            action = input('gvoice> ').lower().strip()
-        except (EOFError, KeyboardInterrupt):
-            exit(0)
-        if not action:
-            continue
-
-        handle_action(voice, action)
-
-
-action_aliases = dict(
-    q='quit',
-    exit='quit',
-    li='login',
-    lo='logout',
-    c='call',
-    cc='cancelcall',
-    s='sendsms',
-    se='search',
-    d='download',
-    t='trash',
-    sp='spam',
-    i='inbox',
-    v='voicemail',
-    a='all',
-    st='starred',
-    m='missed',
-    re='received',
-    r='recorded',
-    sm='sms',
-)
-
-
-def call(voice):
-    voice.call(
-        input('Outgoing number: '),
-        input('Forwarding number [optional]: ') or None,
-        int(input('Phone type [1-Home, 2-Mobile, 3-Work, 7-Gizmo]:') or 2),
-    )
-    print('Calling...')
-
-
-def send_sms(voice):
-    voice.send_sms(input('Phone number: '), input('Message: '))
-    print('Message Sent')
-
-
-def search(voice):
-    se = voice.search(input('Search query: '))
-    print(se)
-    pprint(se.messages)
-
-
-def download(voice):
-    print('MP3 downloaded to {}'.format(voice.download(input('Message sha1: '))))
-
-
-def handle_action(voice, action):
-    fn_map = dict(
-        quit=functools.partial(exit, 0),
-        login=login,
-        logout=voice.logout,
-        call=functools.partial(call, voice),
-        cancelcall=voice.cancel,
-        sendsms=send_sms,
-        download=download,
-        help=functools.partial(print, parser.usage),
-    )
-    folder_names = (
-        'trash spam inbox voicemail all starred missed received recorded sms'.split()
-    )
-    fn_map.update(
-        (name, functools.partial(pprint_folder, name)) for name in folder_names
-    )
-    pure_action = action_aliases.get(action, action)
-    return fn_map.get(pure_action, lambda: None)()
-
-
-def run_other(voice, action, args):
-    if action == 'send_sms':
-        try:
-            num, args = args[0], args[1:]
-        except Exception:
-            print('Please provide a message')
-            exit(0)
-        args = (num, ' '.join(args))
-    getattr(voice, action)(*args)
-
-
-def main():
-    options, args = parser.parse_args()
-
-    try:
-        action, args = args[0], args[1:]
-    except IndexError:
-        action = 'interactive'
-
-    if action == 'help':
-        print(parser.usage)
-        exit(0)
-
-    voice = Voice()
-    login()
-
-    register(logout)
-
-    globals().get(f'run_{action}', run_other)(voice, action, args)
-
-
-__name__ == '__main__' and main()
+if __name__ == '__main__':
+    main()

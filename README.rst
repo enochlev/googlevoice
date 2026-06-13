@@ -22,11 +22,110 @@ Python Google Voice Library
 
 Based on pygooglevoice by Joe McCall & Justin Quick.
 
-This project is *essentially broken* as the login API has changed and a new technique for logging in has not been developed. Please see `issue 8 <https://github.com/jaraco/googlevoice/issues/8>`_ for details.
+Expose the Google Voice "API" to Python: send and read SMS and list your
+conversations.
 
 
-Exposing the Google Voice "API" to the Python language
--------------------------------------------------------
+Status
+======
 
-Google Voice for Python Allows you to place calls, send sms, download voicemail, and check the various folders of your Google Voice Account.
-You can use the Python API or command line script to schedule calls, check for new recieved calls/sms, or even sync your recorded voicemails/calls.
+For years this library was broken: Google retired the legacy
+``/voice/b/0/`` HTML endpoints it scraped, so login stopped working
+(`issue #8 <https://github.com/jaraco/googlevoice/issues/8>`_).
+
+It has now been **rewritten against the modern Google Voice web API** that
+``voice.google.com`` itself uses. Authentication no longer needs your password:
+you sign in once in a real browser, and the library reuses the resulting
+session (which is portable to any machine).
+
+
+Installation
+============
+
+::
+
+    pip install googlevoice
+
+The one-time browser login additionally needs Google Chrome installed and the
+``nodriver`` package (``pip install nodriver``); after that, day-to-day use is
+pure ``requests`` and needs no browser.
+
+
+Authenticate (once)
+====================
+
+Google's login is JavaScript-heavy and bot-protected, so we drive a real
+(undetected) Chrome to let you sign in normally — password, 2-step
+verification, passkeys and captchas all just work::
+
+    python -m googlevoice.auth login
+
+A Chrome window opens. Sign in to the Google account that owns your Voice
+number and wait on the inbox; login is detected automatically and your session
+is saved to ``~/.googlevoice/session.json``.
+
+**Sessions are portable.** That ``session.json`` is all the library needs.
+Copy it to a headless server, a container, a Raspberry Pi — anywhere — and the
+API works there with no browser and no further login. Re-run ``login`` only if
+the session is revoked or expires::
+
+    python -m googlevoice.auth check     # is my saved session still valid?
+
+Keep ``session.json`` private: it grants access to your Google Voice account.
+
+
+Usage
+=====
+
+.. code-block:: python
+
+    from googlevoice import Voice
+
+    voice = Voice()                     # loads ~/.googlevoice/session.json
+    print(voice.number)                 # your Google Voice number, e.g. +12085551234
+
+    # Read recent conversations (pure requests, no browser)
+    for thread in voice.inbox():
+        print(thread.contact, '->', thread.latest_text)
+
+    # Read one conversation (numbers may be bare/formatted; +1 assumed)
+    convo = voice.thread('208-555-0123', messages=100)
+    for msg in reversed(convo.messages):       # oldest first
+        print(msg.start_time, msg.text)
+
+The command line mirrors this (``python -m googlevoice inbox``,
+``... thread NUMBER -n 100``), and ``number``/``inbox``/``thread`` take
+``--json`` for scripting.
+
+Point at a non-default session file with
+``Voice(session_path='/path/to/session.json')`` or pass
+``Voice(credentials=...)`` (see ``googlevoice.auth.Credentials``).
+
+Sending an SMS is gated by Google behind anti-abuse tokens (reCAPTCHA +
+BotGuard) that can only be produced in a browser, so it is done by driving the
+real web app (which reuses the profile from ``login``):
+
+.. code-block:: python
+
+    from googlevoice.browser import BrowserSender
+
+    with BrowserSender() as sender:
+        sender.send_sms('+12085551234', 'Hello from Python!')
+
+Or from the command line: ``python -m googlevoice send +12085551234 "hi"``.
+
+
+How it works
+============
+
+The modern web app authenticates each request to
+``https://clients6.google.com/voice/v1/voiceclient/...`` with a
+``SAPISIDHASH`` — a SHA-1 over the request timestamp, your Google ``SAPISID``
+cookies, and the origin. It needs no OAuth flow and does not expire on its own
+(the cookies do the work), which is what makes a saved session portable.
+
+``googlevoice.auth`` harvests the Google cookies during the browser login and
+computes that hash for every call; ``googlevoice.voice`` wraps the JSON
+endpoints. See `issue #7 <https://github.com/jaraco/googlevoice/issues/7>`_ and
+`issue #8 <https://github.com/jaraco/googlevoice/issues/8>`_ for the
+reverse-engineering history.

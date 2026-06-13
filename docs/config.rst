@@ -1,47 +1,45 @@
-.. _config:
+.. _auth:
 
 
-Configuration
-=============
+Authentication
+==============
 
-When you first install the module, it places an ini configuration
-file in yournamed ``.gvoice`` in your home directory. This runs the ``gvoice``
-and other scripts with your personal configuration defined in this file.
-Run by default, these parameters are prompted for.
-Edit this file and fill in your personal configuration information.
-If you enter your ``password``, it must be raw text so watch the privileges on this file.
+Google Voice no longer supports password login from a script; the modern web
+app authenticates with your Google session cookies. You sign in once in a real
+browser, and the library reuses the saved session afterwards.
 
+Sign in (once)
+--------------
 
-Settings by Section
----------------------
+::
 
-auth
-^^^^
+    python -m googlevoice.auth login
 
-Login credentials for http://google.com/voice
+A Chrome window opens. Sign in to the Google account that owns your Voice
+number -- password, 2-step verification, and passkeys all work normally -- and
+wait on the inbox. Login is detected automatically and the session is written
+to ``~/.googlevoice/session.json``.
 
-**email**
+Using and moving the session
+----------------------------
 
-    The Google email account associated with Voice. Can be a gmail username, or proper email address.
+That ``session.json`` is all the library needs to read your account. It is
+**portable**: copy it to a headless server or container and it keeps working
+with no browser. Check whether a saved session is still valid with::
 
-**password**
+    python -m googlevoice.auth check
 
-    Raw password for logging in.
+Re-run ``login`` only if the session is revoked or expires.
 
-gvoice
-^^^^^^^
+.. warning::
+   ``session.json`` grants access to your Google Voice account. Keep it
+   private (it is created with ``0600`` permissions).
 
-**forwardingNumber**
+Sending
+-------
 
-    The number that you make your calls on (eg your Google Voice number)
-
-**phoneType**
-
-    The type of device connected to your ``forwardingNumber``. Options are::
-
-        1. Home
-        2. Mobile
-        3. Work
-        7. Gizmo
-
-    Defaults to ``Mobile``
+Reading is browser-free, but **sending** SMS is gated by Google behind
+anti-abuse tokens (reCAPTCHA + BotGuard) that can only be produced in a
+browser. :class:`googlevoice.browser.BrowserSender` therefore drives the real
+web app to send, reusing the signed-in browser profile from ``login``. Sending
+thus requires Chrome to be installed on the sending machine.

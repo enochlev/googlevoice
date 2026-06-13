@@ -9,7 +9,8 @@ calls, check for new received calls/sms,
 or even sync recorded voicemails/calls.
 """
 
-from .util import Folder, Message, Phone
+from .auth import Credentials
+from .util import Message, Thread
 from .voice import Voice
 
-__all__ = ['Voice', 'Phone', 'Message', 'Folder']
+__all__ = ['Voice', 'Credentials', 'Thread', 'Message']
