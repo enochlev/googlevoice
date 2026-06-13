@@ -1,10 +1,12 @@
 import json
+import os
 import re
 
 import pytest
 import responses
 
 from googlevoice import Credentials, Voice
+from googlevoice import _browserlock as bl
 from googlevoice.__main__ import main
 from googlevoice.auth import API_BASE, load_session, sapisid_hash, save_session
 from googlevoice.util import Message, Thread
@@ -174,6 +176,30 @@ class TestMessage:
         assert msg['incoming'] is True
         # start_time is ISO-8601 with a UTC offset
         assert msg['start_time'].endswith('+00:00')
+
+
+class TestProfileLock:
+    @pytest.mark.skipif(bl.fcntl is None, reason='POSIX advisory locks only')
+    def test_busy_profile_raises(self, tmp_path):
+        held = bl.ProfileLock(tmp_path)
+        held.acquire()
+        try:
+            with pytest.raises(bl.BrowserBusyError):
+                bl.ProfileLock(tmp_path).acquire()  # same profile, already locked
+        finally:
+            held.release()
+        # released -> can acquire again
+        again = bl.ProfileLock(tmp_path)
+        again.acquire()
+        again.release()
+
+    @pytest.mark.skipif(os.name != 'posix', reason='symlink / os.kill semantics')
+    def test_clears_stale_singleton(self, tmp_path):
+        # Chrome's lock owned by a dead pid should be removed.
+        (tmp_path / 'SingletonLock').symlink_to(f'somehost-{0x7FFFFFFF}')
+        assert os.path.lexists(tmp_path / 'SingletonLock')
+        bl.clear_stale_singleton(tmp_path)
+        assert not os.path.lexists(tmp_path / 'SingletonLock')
 
 
 class TestCLI:

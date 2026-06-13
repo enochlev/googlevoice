@@ -26,9 +26,13 @@ from __future__ import annotations
 
 import logging
 
+from ._browserlock import BrowserBusyError, ProfileLock
 from .auth import DEFAULT_PROFILE_DIR, ORIGIN
 from .util import APIError, LoginError
 from .voice import normalize_number
+
+# Re-exported so callers can ``from googlevoice.browser import BrowserBusyError``.
+__all__ = ['BrowserSender', 'BrowserBusyError']
 
 log = logging.getLogger(__name__)
 
@@ -77,13 +81,18 @@ class BrowserSender:
         *,
         headless: bool = False,
         timeout: float = 60,
+        wait: bool = False,
     ):
         self.profile_dir = profile_dir
         self.headless = headless
         self.timeout = timeout
+        # wait=False -> raise BrowserBusyError if the profile is already in use;
+        # wait=True -> queue until it frees up.
+        self.wait = wait
         self._browser = None
         self._tab = None
         self._loop = None
+        self._lock = None
         self._statuses: list[int] = []
 
     # ------------------------------------------------------------------ #
@@ -99,8 +108,16 @@ class BrowserSender:
     def start(self) -> None:
         import nodriver as uc
 
-        self._loop = uc.loop()
-        self._loop.run_until_complete(self._start())
+        # One Chrome per profile: take the lock (clearing any stale one) before
+        # launching, so concurrent use fails fast instead of cryptically.
+        self._lock = ProfileLock(self.profile_dir, wait=self.wait)
+        self._lock.acquire()
+        try:
+            self._loop = uc.loop()
+            self._loop.run_until_complete(self._start())
+        except BaseException:
+            self.close()  # release the lock / stop a half-started browser
+            raise
 
     async def _start(self) -> None:
         import nodriver as uc
@@ -134,6 +151,9 @@ class BrowserSender:
         if self._browser is not None:
             self._browser.stop()
             self._browser = self._tab = None
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
 
     # ------------------------------------------------------------------ #
     # sending
