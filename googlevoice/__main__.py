@@ -7,6 +7,7 @@ Command-line interface for googlevoice.  Invoke with ``python -m googlevoice``.
     python -m googlevoice inbox [-n N]         # list recent conversations
     python -m googlevoice thread NUMBER [-n N] # show up to N messages with NUMBER
     python -m googlevoice send NUMBER TEXT     # send an SMS (drives a browser)
+    python -m googlevoice call NUMBER [--say TEXT|--goal TEXT]  # call (drives a browser)
 
 Add ``--json`` to ``number``/``inbox``/``thread`` for machine-readable output.
 Numbers may be given formatted or bare (e.g. ``2085551234``); a missing country
@@ -55,6 +56,60 @@ def _build_parser() -> argparse.ArgumentParser:
     p_send = sub.add_parser('send', help='Send an SMS (launches a browser)')
     p_send.add_argument('number', help='Recipient, e.g. +12085551234')
     p_send.add_argument('text', nargs='+', help='Message text')
+
+    p_call = sub.add_parser('call', help='Place a call (launches a browser)')
+    p_call.add_argument('number', help='Who to call, e.g. +12085551234')
+    src = p_call.add_mutually_exclusive_group()
+    src.add_argument(
+        '--say',
+        metavar='TEXT',
+        help='text to speak into the call via TTS (needs the tts extra)',
+    )
+    src.add_argument(
+        '--goal',
+        metavar='TEXT|@FILE',
+        help='[realtime] goal for the live voice agent; literal text or @path',
+    )
+    p_call.add_argument(
+        '--voice',
+        default=None,
+        help='voice: edge-tts voice for --say, or OpenAI voice for --goal',
+    )
+    p_call.add_argument(
+        '--model',
+        default='gpt-realtime-2',
+        help='[--goal] OpenAI Realtime model (default gpt-realtime-2)',
+    )
+    p_call.add_argument(
+        '--max-seconds',
+        type=float,
+        default=240.0,
+        help='[--goal] max call duration for the live agent (default 180)',
+    )
+    p_call.add_argument(
+        '--speed',
+        type=float,
+        default=None,
+        help='[--goal] agent speaking rate, 1.0=normal (default 1.2)',
+    )
+    p_call.add_argument(
+        '--lead-silence',
+        type=float,
+        default=None,
+        help='seconds of silence prepended to the audio (default 1)',
+    )
+    p_call.add_argument(
+        '--hold',
+        type=float,
+        default=None,
+        help='seconds to stay on once connected (default: audio length, else 20)',
+    )
+    p_call.add_argument(
+        '--ring-timeout',
+        type=float,
+        default=45.0,
+        help='seconds to wait for an answer before giving up (default 45)',
+    )
 
     return parser
 
@@ -112,11 +167,59 @@ def _cmd_send(args) -> None:
     print('Sent.')
 
 
+def _cmd_call(args) -> None:
+    if args.goal is not None:
+        import logging
+
+        from .realtime import load_goal, place_realtime_call
+
+        logging.basicConfig(level=logging.INFO, format='%(name)s: %(message)s')
+        kw = {'voice': args.voice} if args.voice is not None else {}
+        if args.speed is not None:
+            kw['speed'] = args.speed
+        outcome = place_realtime_call(
+            args.number,
+            load_goal(args.goal),
+            model=args.model,
+            ring_timeout=args.ring_timeout,
+            max_seconds=args.max_seconds,
+            **kw,
+        )
+        print(f'Call {outcome}.')
+        return
+
+    if args.say is not None:
+        from .playback import place_say_call
+
+        kw = {}
+        if args.voice is not None:
+            kw['voice'] = args.voice
+        if args.lead_silence is not None:
+            kw['lead_silence'] = args.lead_silence
+        outcome = place_say_call(
+            args.number,
+            args.say,
+            ring_timeout=args.ring_timeout,
+            **kw,
+        )
+        print(f'Call {outcome}.')
+        return
+
+    from .call import Caller
+
+    with Caller() as caller:
+        outcome = caller.place_call(
+            args.number, hold=args.hold, ring_timeout=args.ring_timeout
+        )
+    print(f'Call {outcome}.')
+
+
 _COMMANDS = {
     'number': _cmd_number,
     'inbox': _cmd_inbox,
     'thread': _cmd_thread,
     'send': _cmd_send,
+    'call': _cmd_call,
 }
 
 

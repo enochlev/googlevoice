@@ -37,6 +37,11 @@ browser = [
 	"nodriver",
 ]
 
+# Speak text into a call (`--say`) via edge-tts; needs a browser too.
+tts = [
+	"edge-tts",
+]
+
 test = [
 	# upstream
 	"pytest >= 6, != 8.1.*",
