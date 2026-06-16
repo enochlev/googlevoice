@@ -33,7 +33,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import pathlib
+import sys
 import time
 
 import requests
@@ -71,6 +73,39 @@ DEFAULT_PROFILE_DIR = DEFAULT_DIR / 'chrome-profile'
 
 # Cookies that signal a usable Google login (used to detect login completion).
 ESSENTIAL_COOKIES = {'SID', 'SAPISID', '__Secure-3PSID'}
+
+
+# --------------------------------------------------------------------------- #
+# Browser launch helpers (shared by browser-driven features)
+# --------------------------------------------------------------------------- #
+def headless_default() -> bool:
+    """
+    Whether to run Chrome headless by default.
+
+    On Linux a *headed* Chrome cannot start without a display server, so if
+    neither ``DISPLAY`` nor ``WAYLAND_DISPLAY`` is set (a headless server,
+    container, CI, or a tool that spawns us without a display) we must go
+    headless. On macOS/Windows headed always works, so default to headed.
+    """
+    if sys.platform.startswith('linux'):
+        return not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+    return False
+
+
+def browser_launch_args(*, no_sandbox: bool | None = None) -> list[str]:
+    """
+    Common ``browser_args`` for ``nodriver``/Chrome.
+
+    ``--no-sandbox`` is added only when running as root (``no_sandbox=None``),
+    since Chrome's sandbox can't initialize as root/in many containers and
+    refuses to launch; on a normal user account it stays on (safer).
+    """
+    args = ['--no-first-run', '--no-default-browser-check']
+    if no_sandbox is None:
+        no_sandbox = os.name == 'posix' and getattr(os, 'geteuid', lambda: 1)() == 0
+    if no_sandbox:
+        args.append('--no-sandbox')
+    return args
 
 
 class AuthError(Exception):
@@ -214,7 +249,7 @@ async def _browser_login_async(
     browser = await uc.start(
         headless=headless,
         user_data_dir=str(profile_dir),
-        browser_args=['--no-first-run', '--no-default-browser-check'],
+        browser_args=browser_launch_args(),
     )
     try:
         await browser.get(ORIGIN)

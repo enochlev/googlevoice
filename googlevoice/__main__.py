@@ -120,6 +120,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Recipient, e.g. +12085551234 (comma-separate two+ for a group)',
     )
     p_send.add_argument('text', nargs='+', help='Message text')
+    p_send.add_argument(
+        '--headless',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='run Chrome headless (default: auto -- headless if no display)',
+    )
 
     p_cap = sub.add_parser('capture', help='Record real API calls (verify endpoints)')
     p_cap.add_argument(
@@ -240,7 +246,7 @@ def _cmd_download(args) -> None:
 def _cmd_send(args) -> None:
     from .browser import BrowserSender
 
-    with BrowserSender() as sender:
+    with BrowserSender(headless=args.headless) as sender:
         sender.send_sms(args.number, ' '.join(args.text))
     print('Sent.')
 

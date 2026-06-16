@@ -27,7 +27,13 @@ from __future__ import annotations
 import logging
 
 from ._browserlock import BrowserBusyError, ProfileLock
-from .auth import DEFAULT_DIR, DEFAULT_PROFILE_DIR, ORIGIN
+from .auth import (
+    DEFAULT_DIR,
+    DEFAULT_PROFILE_DIR,
+    ORIGIN,
+    browser_launch_args,
+    headless_default,
+)
 from .util import APIError, LoginError
 from .voice import normalize_number
 
@@ -79,12 +85,14 @@ class BrowserSender:
         self,
         profile_dir=DEFAULT_PROFILE_DIR,
         *,
-        headless: bool = False,
+        headless: bool | None = None,
         timeout: float = 60,
         wait: bool = False,
     ):
         self.profile_dir = profile_dir
-        self.headless = headless
+        # headless=None -> auto: headed if a display is available, else headless
+        # (a headed Chrome can't start on a display-less server/container).
+        self.headless = headless_default() if headless is None else headless
         self.timeout = timeout
         # wait=False -> raise BrowserBusyError if the profile is already in use;
         # wait=True -> queue until it frees up.
@@ -126,7 +134,7 @@ class BrowserSender:
         self._browser = await uc.start(
             headless=self.headless,
             user_data_dir=str(self.profile_dir),
-            browser_args=['--no-first-run', '--no-default-browser-check'],
+            browser_args=browser_launch_args(),
         )
         self._tab = await self._browser.get(ORIGIN)
 
@@ -287,7 +295,7 @@ def capture_api_calls(
     profile_dir=DEFAULT_PROFILE_DIR,
     *,
     seconds: float = 180,
-    headless: bool = False,
+    headless: bool | None = None,
     wait: bool = False,
     out_path=DEFAULT_CAPTURE_PATH,
 ) -> list[dict]:
@@ -308,6 +316,8 @@ def capture_api_calls(
     """
     import nodriver as uc
 
+    if headless is None:
+        headless = headless_default()
     lock = ProfileLock(profile_dir, wait=wait)
     lock.acquire()
     try:
@@ -336,11 +346,10 @@ async def _capture_async(profile_dir, *, seconds, headless, out_path) -> list[di
     browser = await uc.start(
         headless=headless,
         user_data_dir=str(profile_dir),
+        # keep cross-origin iframes in the page process so their requests surface
+        # on the page target rather than a separate one we'd miss.
         browser_args=[
-            '--no-first-run',
-            '--no-default-browser-check',
-            # keep cross-origin iframes in the page process so their requests
-            # surface on the page target rather than a separate one we'd miss.
+            *browser_launch_args(),
             '--disable-features=IsolateOrigins,site-per-process',
         ],
     )
