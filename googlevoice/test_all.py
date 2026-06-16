@@ -356,8 +356,9 @@ class TestProfileLock:
         held = bl.ProfileLock(tmp_path)
         held.acquire()
         try:
-            with pytest.raises(bl.BrowserBusyError):
+            with pytest.raises(bl.BrowserBusyError) as exc:
                 bl.ProfileLock(tmp_path).acquire()  # same profile, already locked
+            assert str(os.getpid()) in str(exc.value)  # error names the holder
         finally:
             held.release()
         # released -> can acquire again

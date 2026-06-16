@@ -48,6 +48,15 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _holder_hint(lockpath) -> str:
+    """`` (PID 1234)`` for the process holding the lock, or '' if unknown."""
+    try:
+        pid = pathlib.Path(lockpath).read_text().strip()
+    except OSError:
+        pid = ''
+    return f' (held by PID {pid})' if pid else ''
+
+
 def clear_stale_singleton(profile_dir) -> None:
     """
     Remove Chrome's ``Singleton*`` files if the owning process is gone.
@@ -91,11 +100,18 @@ class ProfileLock:
         clear_stale_singleton(self.profile_dir)
         if fcntl is None:  # pragma: no cover - rely on Chrome's own lock
             return
-        self._fh = open(self.profile_dir / '.googlevoice.lock', 'w')
+        lockpath = self.profile_dir / '.googlevoice.lock'
+        lockpath.touch(exist_ok=True)  # 'r+' (don't truncate -- preserves holder pid)
+        self._fh = open(lockpath, 'r+')
         start = time.monotonic()
         while True:
             try:
                 fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Record our pid so a blocked waiter can report who holds it.
+                self._fh.seek(0)
+                self._fh.truncate()
+                self._fh.write(str(os.getpid()))
+                self._fh.flush()
                 return
             except OSError:
                 if not self.wait or time.monotonic() - start > self.timeout:
@@ -103,9 +119,9 @@ class ProfileLock:
                     self._fh = None
                     raise BrowserBusyError(
                         f'Another googlevoice browser is already running on '
-                        f'{self.profile_dir}. Wait for it to finish, pass '
-                        f'wait=True to queue, or use a separate profile_dir to '
-                        f'run in parallel.'
+                        f'{self.profile_dir}{_holder_hint(lockpath)}. Wait for it '
+                        f'to finish, pass wait=True to queue, or use a separate '
+                        f'profile_dir to run in parallel.'
                     ) from None
                 time.sleep(0.5)
 
