@@ -43,8 +43,9 @@ def _ms_to_datetime(ms: Any) -> datetime | None:
 class Message:
     """A single message (SMS, voicemail, or call) within a thread."""
 
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, voice=None):
         self._data = data
+        self.voice = voice
 
     @property
     def id(self) -> str | None:
@@ -57,11 +58,45 @@ class Message:
 
     @property
     def type(self) -> str | None:
-        """e.g. ``smsIn``, ``smsOut``, ``voicemail``, ``missed``."""
+        """``smsIn``, ``smsOut``, ``sip`` (a call), ``missed``, ``voicemail``."""
         return self._data.get('type')
 
     @property
+    def coarse_type(self) -> str | None:
+        """For calls, the direction: ``callTypeOutgoing`` / ``callTypeIncoming``
+        / ``callTypeMissed``."""
+        return self._data.get('coarseType')
+
+    @property
+    def duration(self) -> int | None:
+        """Call/voicemail duration in seconds, if any."""
+        return self._data.get('duration')
+
+    @property
+    def is_voicemail(self) -> bool:
+        return 'voicemail' in (self.type or '').lower()
+
+    @property
+    def recording_url(self) -> str | None:
+        """URL of the voicemail/recording audio, if any."""
+        return self._data.get('recordingUrl')
+
+    @property
+    def has_audio(self) -> bool:
+        """Whether this message carries downloadable voicemail/recording audio."""
+        return bool(self.recording_url)
+
+    def download(self, dest: str | None = None) -> str:
+        """Download the voicemail/recording audio; see :meth:`Voice.download`."""
+        if self.voice is None:
+            raise DownloadError('Message has no Voice attached to download with.')
+        return self.voice.download(self, dest)
+
+    @property
     def incoming(self) -> bool:
+        """True for received SMS/calls (``smsIn``, ``callTypeIncoming``)."""
+        if self.coarse_type:
+            return self.coarse_type == 'callTypeIncoming'
         return (self.type or '').lower().endswith('in')
 
     @property
@@ -119,12 +154,17 @@ class Thread:
     @property
     def messages(self) -> list[Message]:
         """Messages, newest first (as Google returns them)."""
-        return [Message(m) for m in self._data.get('item', [])]
+        return [Message(m, self.voice) for m in self._data.get('item', [])]
+
+    @property
+    def voicemails(self) -> list[Message]:
+        """Just the voicemail messages in this conversation."""
+        return [m for m in self.messages if m.is_voicemail]
 
     @property
     def latest(self) -> Message | None:
         items = self._data.get('item') or []
-        return Message(items[0]) if items else None
+        return Message(items[0], self.voice) if items else None
 
     @property
     def latest_text(self) -> str | None:
@@ -142,6 +182,35 @@ class Thread:
     def reply(self, text: str) -> dict:
         """Send ``text`` back into this conversation."""
         return self.voice.send_sms(self.contact, text, thread_id=self.id)
+
+    # Conversation actions -- thin shortcuts onto the matching Voice method.
+    def archive(self) -> dict:
+        """Move this conversation to the Archive."""
+        return self.voice.archive(self)
+
+    def unarchive(self) -> dict:
+        """Restore this conversation from the Archive."""
+        return self.voice.unarchive(self)
+
+    def mark_spam(self) -> dict:
+        """Flag this conversation as spam."""
+        return self.voice.mark_spam(self)
+
+    def mark_not_spam(self) -> dict:
+        """Clear the spam flag from this conversation."""
+        return self.voice.mark_not_spam(self)
+
+    def block(self) -> dict:
+        """Block the other party on this conversation."""
+        return self.voice.block(self)
+
+    def unblock(self) -> dict:
+        """Unblock the other party on this conversation."""
+        return self.voice.unblock(self)
+
+    def mark_read(self, read: bool = True) -> dict:
+        """Mark this conversation read (``read=False`` marks it unread)."""
+        return self.voice.mark_read(self, read)
 
     def as_dict(self) -> dict:
         """A plain, JSON-serializable view of this conversation."""

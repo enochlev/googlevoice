@@ -10,7 +10,7 @@ from googlevoice import _browserlock as bl
 from googlevoice.__main__ import main
 from googlevoice.auth import API_BASE, load_session, sapisid_hash, save_session
 from googlevoice.util import Message, Thread
-from googlevoice.voice import _thread_id_for, normalize_number
+from googlevoice.voice import Folder, _thread_id_for, normalize_number
 
 FAKE_COOKIES = [
     {'name': 'SAPISID', 'value': 'sapisid-val', 'domain': '.google.com', 'path': '/'},
@@ -52,9 +52,42 @@ THREADS_RESPONSE = {
 }
 
 
+# A thread holding a voicemail (with audio + transcript) and a missed call --
+# exercises the type filters and download.
+VOICEMAIL_THREAD = {
+    'thread': [
+        {
+            'id': 't.+12085559999',
+            'read': True,
+            'isText': False,
+            'headingContactsPhoneNumberKey': ['+12085559999'],
+            'item': [
+                {
+                    'id': 'vm1',
+                    'startTime': '1781375718535',
+                    'did': '+12085551234',
+                    'contact': {'phoneNumber': '+12085559999'},
+                    'type': 'voicemail',
+                    'messageText': 'hey call me back',
+                    'recordingUrl': 'https://example.test/vm1.mp3',
+                },
+                {
+                    'id': 'm1',
+                    'startTime': '1781375710000',
+                    'contact': {'phoneNumber': '+12085559999'},
+                    'type': 'missed',
+                    'coarseType': 'callTypeMissed',
+                },
+            ],
+        }
+    ]
+}
+
+
 @pytest.fixture
 def voice():
-    return Voice(credentials=Credentials(FAKE_COOKIES))
+    # auto_login off so a mocked 401 doesn't try to launch a real browser
+    return Voice(credentials=Credentials(FAKE_COOKIES), auto_login=False)
 
 
 class TestAuth:
@@ -98,11 +131,18 @@ class TestVoiceReads:
 
     @responses.activate
     def test_thread_by_number(self, voice):
-        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
+        single = {'thread': THREADS_RESPONSE['thread'][0]}
+        responses.post(API_BASE + 'api2thread/get', json=single)
         found = voice.thread('+12085550000')
         assert found is not None
         assert found.id == 't.+12085550000'
-        assert voice.thread('+19998887777') is None  # not in the list
+        # request asks for the normalized thread id
+        assert json.loads(responses.calls[-1].request.body)[0] == 't.+12085550000'
+
+    @responses.activate
+    def test_thread_not_found(self, voice):
+        responses.post(API_BASE + 'api2thread/get', json={})  # no 'thread'
+        assert voice.thread('+19998887777') is None
 
     @responses.activate
     def test_threads_messages_param(self, voice):
@@ -113,9 +153,10 @@ class TestVoiceReads:
 
     @responses.activate
     def test_thread_accepts_formatted_number(self, voice):
-        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
-        # thread id in the fixture is t.+12085550000
+        responses.post(API_BASE + 'api2thread/get', json={'thread': {'id': 't.x'}})
         assert voice.thread('(208) 555-0000') is not None
+        # formatted number is normalized before becoming the thread id
+        assert json.loads(responses.calls[-1].request.body)[0] == 't.+12085550000'
 
     @responses.activate
     def test_login_error_on_401(self, voice):
@@ -124,6 +165,25 @@ class TestVoiceReads:
         responses.post(API_BASE + 'account/get', status=401, body='nope')
         with pytest.raises(LoginError):
             voice.account()
+
+    @responses.activate
+    def test_auto_login_refreshes_and_retries(self, monkeypatch):
+        import googlevoice.voice as voicemod
+
+        # First account/get 401s, then (after a "refresh") succeeds.
+        responses.post(API_BASE + 'account/get', status=401, body='nope')
+        responses.post(API_BASE + 'account/get', json=ACCOUNT_RESPONSE)
+
+        calls = []
+
+        def fake_login(*a, **k):
+            calls.append(1)
+            return Credentials(FAKE_COOKIES)
+
+        monkeypatch.setattr(voicemod.auth, 'browser_login', fake_login)
+        v = Voice(credentials=Credentials(FAKE_COOKIES), auto_login=True)
+        assert v.number == '+12085551234'
+        assert calls == [1]  # refreshed exactly once
 
 
 class TestSend:
@@ -143,6 +203,7 @@ class TestSend:
         assert _thread_id_for('(208) 555-0000') == 't.+12085550000'  # normalized
         assert _thread_id_for('t.+12085550000') == 't.+12085550000'
         assert _thread_id_for('g.Group Message.x') == 'g.Group Message.x'
+        assert _thread_id_for('c.PCIFABCDEF') == 'c.PCIFABCDEF'  # call id passthrough
 
 
 class TestNumbers:
@@ -176,6 +237,117 @@ class TestMessage:
         assert msg['incoming'] is True
         # start_time is ISO-8601 with a UTC offset
         assert msg['start_time'].endswith('+00:00')
+
+
+class TestFolders:
+    @responses.activate
+    def test_folder_selectors(self, voice):
+        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
+        for call, expected in [
+            (voice.calls, Folder.CALLS),
+            (voice.inbox, Folder.INBOX),
+            (voice.spam, Folder.SPAM),
+            (voice.archived, Folder.ARCHIVE),
+        ]:
+            call()
+            assert json.loads(responses.calls[-1].request.body)[0] == expected
+
+
+class TestTypeFilters:
+    @responses.activate
+    def test_voicemails(self, voice):
+        responses.post(API_BASE + 'api2thread/list', json=VOICEMAIL_THREAD)
+        vms = voice.voicemails()
+        assert len(vms) == 1
+        assert vms[0].is_voicemail
+        assert vms[0].text == 'hey call me back'
+        assert vms[0].has_audio
+        assert vms[0].recording_url == 'https://example.test/vm1.mp3'
+        # voicemails come from the Voicemail folder
+        assert json.loads(responses.calls[0].request.body)[0] == Folder.VOICEMAIL
+
+    @responses.activate
+    def test_missed(self, voice):
+        responses.post(API_BASE + 'api2thread/list', json=VOICEMAIL_THREAD)
+        missed = voice.missed()
+        assert len(missed) == 1
+        assert missed[0].type == 'missed'
+        assert json.loads(responses.calls[0].request.body)[0] == Folder.CALLS
+
+
+class TestThreadActions:
+    """thread/batchupdateattributes -- body [[[values, mask, 1]]]."""
+
+    @responses.activate
+    def test_archive_sets_index_5(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        voice.archive('+12085550000')
+        body = json.loads(responses.calls[-1].request.body)
+        values, mask, tail = body[0][0]
+        assert values == ['t.+12085550000', None, None, None, None, 1]
+        assert mask == [None, None, None, None, None, 1]
+        assert tail == 1
+
+    @responses.activate
+    def test_unarchive_sets_index_5_to_zero(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        voice.unarchive('+12085550000')
+        values = json.loads(responses.calls[-1].request.body)[0][0][0]
+        assert values == ['t.+12085550000', None, None, None, None, 0]
+
+    @responses.activate
+    def test_spam_block_read_indices(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        for action, index in [
+            (voice.mark_spam, 2),
+            (voice.block, 1),
+            (voice.mark_read, 3),
+        ]:
+            action('+12085550000')
+            values = json.loads(responses.calls[-1].request.body)[0][0][0]
+            assert values[index] == 1 and len(values) == index + 1
+
+    @responses.activate
+    def test_thread_shortcut_calls_voice(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        thread = Thread(voice, THREADS_RESPONSE['thread'][0])
+        thread.mark_spam()
+        values = json.loads(responses.calls[-1].request.body)[0][0][0]
+        assert values == ['t.+12085550000', None, 1]  # index 2 = spam
+
+    def test_delete_not_implemented(self, voice):
+        with pytest.raises(NotImplementedError):
+            voice.delete('+12085550000')
+
+
+class TestDownload:
+    @responses.activate
+    def test_download_saves_audio(self, voice, tmp_path):
+        responses.post(API_BASE + 'api2thread/list', json=VOICEMAIL_THREAD)
+        responses.get('https://example.test/vm1.mp3', body=b'ID3audio')
+        vm = voice.voicemails()[0]
+        path = vm.download(str(tmp_path))
+        assert path.endswith('vm1.mp3')
+        assert (tmp_path / 'vm1.mp3').read_bytes() == b'ID3audio'
+
+    @responses.activate
+    def test_download_without_audio_raises(self, voice):
+        from googlevoice.util import DownloadError
+
+        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
+        msg = voice.inbox()[0].latest  # an SMS, no audio
+        with pytest.raises(DownloadError):
+            msg.download()
+
+
+class TestSearch:
+    @responses.activate
+    def test_search_body_and_parse(self, voice):
+        responses.post(API_BASE + 'api2thread/search', json=THREADS_RESPONSE)
+        results = voice.search('hello', count=50)
+        assert len(results) == 1
+        body = json.loads(responses.calls[-1].request.body)
+        assert body[0] == 'hello' and body[1] == 50
 
 
 class TestProfileLock:
