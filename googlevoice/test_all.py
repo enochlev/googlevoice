@@ -44,6 +44,9 @@ THREADS_RESPONSE = {
                     'did': '+12085551234',
                     'contact': {'phoneNumber': '+12085550000', 'name': 'Pat'},
                     'type': 'smsIn',
+                    # real SMS also carry a coarseType -- incoming must not be
+                    # fooled by it (it is never 'callTypeIncoming' for SMS).
+                    'coarseType': 'callTypeSmsIn',
                     'messageText': 'hello there',
                 }
             ],
@@ -225,6 +228,17 @@ class TestMessage:
         assert msg.incoming is True
         assert msg.phone_number == '+12085550000'
         assert msg.start_time is not None
+
+    def test_incoming_direction(self):
+        # SMS: type is authoritative even though a (non-Incoming) coarseType
+        # is present -- the bug this guards against.
+        assert Message({'type': 'smsIn', 'coarseType': 'callTypeSmsIn'}).incoming
+        assert not Message({'type': 'smsOut', 'coarseType': 'callTypeSmsOut'}).incoming
+        # calls/voicemail: direction from coarseType
+        assert not Message({'type': 'sip', 'coarseType': 'callTypeOutgoing'}).incoming
+        assert Message({'type': 'sip', 'coarseType': 'callTypeIncoming'}).incoming
+        assert Message({'type': 'missed', 'coarseType': 'callTypeMissed'}).incoming
+        assert Message({'type': 'voicemail', 'recordingUrl': 'x'}).incoming
 
     def test_as_dict(self):
         thread = Thread(None, THREADS_RESPONSE['thread'][0])

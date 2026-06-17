@@ -94,10 +94,19 @@ class Message:
 
     @property
     def incoming(self) -> bool:
-        """True for received SMS/calls (``smsIn``, ``callTypeIncoming``)."""
-        if self.coarse_type:
-            return self.coarse_type == 'callTypeIncoming'
-        return (self.type or '').lower().endswith('in')
+        """
+        True for things you received (incoming SMS, received or missed calls,
+        voicemail); False for things you sent/placed.
+
+        ``type`` is authoritative for SMS (``smsIn``/``smsOut``). For calls and
+        voicemail, direction is in ``coarseType`` (``callTypeOutgoing`` = placed
+        by you). Note SMS *also* carry a ``coarseType`` (``callTypeSmsIn`` /
+        ``callTypeSmsOut``), so it must not be consulted first.
+        """
+        t = (self.type or '').lower()
+        if t.startswith('sms'):
+            return t.endswith('in')
+        return (self.coarse_type or '').lower() != 'calltypeoutgoing'
 
     @property
     def phone_number(self) -> str | None:
