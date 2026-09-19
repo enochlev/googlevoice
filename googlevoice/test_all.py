@@ -909,6 +909,104 @@ class TestBrowserSession:
         sender._loop.close()
 
 
+class TestCallerDial:
+    """Placing a call: the dial step must never report a call that was not made."""
+
+    MIC = 'Chrome did not grant microphone access'
+
+    def _caller(self, *, wait_state='connected', now_state='ringing'):
+        from googlevoice.call import Caller
+
+        caller = object.__new__(Caller)
+        caller.calls = []
+
+        async def _sleep(seconds):
+            caller.calls.append(('sleep', seconds))
+
+        async def _await_answer(ring_timeout):
+            caller.calls.append(('await_answer', ring_timeout))
+            return wait_state
+
+        async def _call_state():
+            caller.calls.append(('call_state',))
+            return now_state
+
+        async def _hangup():
+            caller.calls.append(('hangup',))
+
+        caller._sleep, caller._await_answer = _sleep, _await_answer
+        caller._call_state, caller._hangup = _call_state, _hangup
+        return caller
+
+    def test_waiting_returns_what_the_ring_settled_to(self):
+        caller = self._caller(wait_state='no-answer')
+        assert _run(caller._settle_dial(True, 45)) == 'no-answer'
+        assert caller.calls == [('await_answer', 45)]
+
+    def test_waiting_rejects_a_blocked_mic(self):
+        from googlevoice.util import APIError
+
+        caller = self._caller(wait_state='mic-blocked')
+        with pytest.raises(APIError, match=self.MIC):
+            _run(caller._settle_dial(True, 45))
+        assert caller.calls[-1] == ('hangup',)
+
+    def test_not_waiting_only_peeks_at_the_panel(self):
+        caller = self._caller(now_state='ringing')
+        assert _run(caller._settle_dial(False, 45)) == 'ringing'
+        assert ('await_answer', 45) not in caller.calls
+        assert ('hangup',) not in caller.calls
+        assert caller.calls[-1] == ('call_state',)
+
+    def test_not_waiting_still_rejects_a_blocked_mic(self):
+        # Before: wait_for_answer=False skipped the check and the caller was
+        # told 'completed' for a call Google Voice never dialed.
+        from googlevoice.util import APIError
+
+        caller = self._caller(now_state='mic-blocked')
+        with pytest.raises(APIError, match=self.MIC):
+            _run(caller._settle_dial(False, 45))
+        assert caller.calls[-1] == ('hangup',)
+
+    def test_caller_close_releases_the_lock_on_interrupt(self, tmp_path):
+        from googlevoice.call import Caller
+
+        caller = Caller(tmp_path / 'profile', session_path=None)
+        caller._loop = asyncio.new_event_loop()
+        caller._browser = browser = FakeBrowser()
+        released = []
+        caller._lock = types.SimpleNamespace(release=lambda: released.append(True))
+
+        async def interrupted(browser):
+            raise KeyboardInterrupt
+
+        caller._shutdown = interrupted
+        with pytest.raises(KeyboardInterrupt):
+            caller.close()
+        assert released == [True]
+        assert browser.stopped
+        assert caller._browser is None and caller._lock is None
+        caller._loop.close()
+
+    def test_caller_close_releases_the_lock_when_shutdown_errors(self, tmp_path):
+        from googlevoice.call import Caller
+
+        caller = Caller(tmp_path / 'profile', session_path=None)
+        caller._loop = asyncio.new_event_loop()
+        caller._browser = browser = FakeBrowser()
+        released = []
+        caller._lock = types.SimpleNamespace(release=lambda: released.append(True))
+
+        async def broken(browser):
+            raise RuntimeError('cdp gone')
+
+        caller._shutdown = broken
+        caller.close()  # an ordinary error is swallowed; Chrome is still stopped
+        assert released == [True]
+        assert browser.stopped
+        caller._loop.close()
+
+
 class TestRealtimeEndCall:
     """The end_call tool is goal-agnostic: the goal text sets its own bar."""
 
@@ -922,7 +1020,19 @@ class TestRealtimeEndCall:
     def _bridge(self):
         from googlevoice.realtime import RealtimeBridge
 
-        return RealtimeBridge('get a callback scheduled', key='test-key')
+        bridge = RealtimeBridge('get a callback scheduled', key='test-key')
+        bridge.END_DELAY = 0  # no goodbye audio to wait for in a test
+        return bridge
+
+    @staticmethod
+    async def _ended(bridge, ev, ws, within=1.0):
+        """Run one end_call and report whether the bridge actually hung up."""
+        await bridge._on_end_call(ev, ws)
+        try:
+            await asyncio.wait_for(bridge._done.wait(), within)
+        except TimeoutError:
+            return False
+        return True
 
     def _event(self, **args):
         return {'call_id': 'c1', 'arguments': json.dumps(args)}
@@ -940,7 +1050,7 @@ class TestRealtimeEndCall:
     def test_goal_met_ends_the_call(self):
         bridge, ws = self._bridge(), self.FakeWS()
         ev = self._event(goal_met=True, summary='They agreed.')
-        _run(bridge._on_end_call(ev, ws))
+        assert _run(self._ended(bridge, ev, ws)) is True
         assert bridge.goal_met is True
         assert bridge.end_summary == 'They agreed.'
         assert bridge._nudges == 0
@@ -949,7 +1059,7 @@ class TestRealtimeEndCall:
     def test_goal_not_met_nudges_instead(self):
         bridge, ws = self._bridge(), self.FakeWS()
         ev = self._event(goal_met=False, summary='No answer yet')
-        _run(bridge._on_end_call(ev, ws))
+        assert _run(self._ended(bridge, ev, ws, within=0.05)) is False
         assert bridge._nudges == 1
         assert bridge.goal_met is False
         kinds = [m['type'] for m in ws.sent]
@@ -961,11 +1071,32 @@ class TestRealtimeEndCall:
 
         bridge, ws = self._bridge(), self.FakeWS()
         bridge._nudges = MAX_NUDGES
-        _run(bridge._on_end_call(self._event(goal_met=False, summary='gave up'), ws))
+        ev = self._event(goal_met=False, summary='gave up')
+        assert _run(self._ended(bridge, ev, ws)) is True
         assert ws.sent == []  # relented; the call is allowed to end
         assert bridge.end_summary == 'gave up'
 
-    def test_malformed_arguments_are_treated_as_not_met(self):
+    @pytest.mark.parametrize(
+        'arguments',
+        [
+            'not json',
+            'null',
+            '[]',
+            '"done"',
+            '{"goal_met": "false", "summary": "x"}',
+            '{"goal_met": "true", "summary": "x"}',
+            '{"goal_met": 1, "summary": "x"}',
+        ],
+    )
+    def test_malformed_arguments_are_treated_as_not_met(self, arguments):
         bridge, ws = self._bridge(), self.FakeWS()
-        _run(bridge._on_end_call({'call_id': 'c1', 'arguments': 'not json'}, ws))
+        ev = {'call_id': 'c1', 'arguments': arguments}
+        assert _run(self._ended(bridge, ev, ws, within=0.05)) is False
         assert bridge._nudges == 1
+        assert bridge.goal_met is False
+
+    def test_summary_must_be_a_string(self):
+        bridge, ws = self._bridge(), self.FakeWS()
+        ev = {'call_id': 'c1', 'arguments': '{"goal_met": true, "summary": 42}'}
+        assert _run(self._ended(bridge, ev, ws)) is True
+        assert bridge.end_summary == ''

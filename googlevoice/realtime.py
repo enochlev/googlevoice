@@ -158,6 +158,10 @@ def load_goal(goal: str) -> str:
 class RealtimeBridge:
     """on_connected hook for :class:`Caller` that runs a live GPT-Realtime agent."""
 
+    # Seconds between an honored end_call and the hang-up, so the goodbye audio
+    # finishes playing.
+    END_DELAY = 2.5
+
     def __init__(
         self,
         goal: str,
@@ -184,6 +188,7 @@ class RealtimeBridge:
         self.goal_met = False
         self.end_summary = ''
         self._nudges = 0  # times we've refused a premature end_call
+        self._end_task: asyncio.Task | None = None  # keeps the hang-up timer alive
 
     async def __call__(self, caller: Caller) -> None:
         import websockets
@@ -357,8 +362,13 @@ class RealtimeBridge:
             args = json.loads(ev.get('arguments') or '{}')
         except (TypeError, ValueError):
             args = {}
-        goal_met = bool(args.get('goal_met'))
-        summary = str(args.get('summary') or '').strip()
+        if not isinstance(args, dict):
+            args = {}  # ``null``, a list, a bare string: nothing usable in it
+        # The schema says boolean.  Only a real ``true`` counts: the string
+        # "false" (or any other junk) must not end the call.
+        goal_met = args.get('goal_met') is True
+        summary = args.get('summary')
+        summary = summary.strip() if isinstance(summary, str) else ''
 
         if not goal_met and self._nudges < MAX_NUDGES:
             self._nudges += 1
@@ -400,7 +410,8 @@ class RealtimeBridge:
         self.goal_met = goal_met
         self.end_summary = summary
         log.info('agent ended the call (goal_met=%s): %s', goal_met, summary or '-')
-        asyncio.create_task(self._end_after(2.5))
+        if self._end_task is None:
+            self._end_task = asyncio.create_task(self._end_after(self.END_DELAY))
 
     async def _end_after(self, delay: float) -> None:
         """End the call after a short delay so the goodbye audio finishes playing."""

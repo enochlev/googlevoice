@@ -30,6 +30,7 @@ into the call).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -39,6 +40,7 @@ from .auth import (
     DEFAULT_PROFILE_DIR,
     DEFAULT_SESSION_PATH,
     ORIGIN,
+    REFRESH_TIMEOUT,
     browser_launch_args,
     close_browser,
     ensure_signed_in,
@@ -230,24 +232,32 @@ class Caller:
         self._signed_in = True
 
     def close(self) -> None:
-        if self._browser is not None:
-            browser, self._browser, self._tab = self._browser, None, None
-            try:
-                self._loop.run_until_complete(self._shutdown(browser))
-            except Exception as err:  # noqa: BLE001 - teardown must not mask the real error
-                log.debug('graceful shutdown failed (%s); terminating', err)
-                with contextlib.suppress(Exception):
-                    browser.stop()
-        if self._lock is not None:
-            self._lock.release()
-            self._lock = None
+        try:
+            if self._browser is not None:
+                browser, self._browser, self._tab = self._browser, None, None
+                try:
+                    self._loop.run_until_complete(self._shutdown(browser))
+                except BaseException as err:
+                    log.debug('graceful shutdown failed (%s); terminating', err)
+                    with contextlib.suppress(Exception):
+                        browser.stop()
+                    if not isinstance(err, Exception):
+                        raise  # Ctrl-C and cancellation still propagate
+        finally:
+            # Whatever happened above, the profile must not stay locked.
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None
 
     async def _shutdown(self, browser) -> None:
         # Keep the portable session current with Google's rotated cookies, then
-        # let Chrome quit cleanly so the profile keeps its login.
+        # let Chrome quit cleanly so the profile keeps its login.  Both steps
+        # are bounded: a wedged Chrome or network must not hang close().
         if self._signed_in and self.session_path is not None:
             with contextlib.suppress(Exception):
-                await refresh_session(browser, self.session_path)
+                await asyncio.wait_for(
+                    refresh_session(browser, self.session_path), REFRESH_TIMEOUT
+                )
         await close_browser(browser)
 
     # ------------------------------------------------------------------ #
@@ -358,21 +368,12 @@ class Caller:
             )
 
         # 3. wait through ringing until the line connects (or give up)
-        if wait_for_answer:
-            state = await self._await_answer(ring_timeout)
-            if state == 'mic-blocked':
-                await self._hangup()
-                raise APIError(
-                    'Chrome did not grant microphone access, so Google Voice '
-                    'never placed the call. Grant the mic to voice.google.com '
-                    'in this profile, or pass '
-                    "extra_browser_args=['--use-fake-ui-for-media-stream']."
-                )
-            if state != 'connected':
-                outcome = 'no-answer' if state == 'no-answer' else 'declined'
-                log.info('not connected (%s); hanging up', state)
-                await self._hangup()
-                return outcome
+        state = await self._settle_dial(wait_for_answer, ring_timeout)
+        if wait_for_answer and state != 'connected':
+            outcome = 'no-answer' if state == 'no-answer' else 'declined'
+            log.info('not connected (%s); hanging up', state)
+            await self._hangup()
+            return outcome
 
         # 4. connected. Hand off to on_connected (e.g. the realtime bridge) if
         #    given; otherwise just hold so the fake-mic audio plays.
@@ -430,6 +431,28 @@ class Caller:
     # ------------------------------------------------------------------ #
     # call-state machine (read from the "Call panel" DOM)
     # ------------------------------------------------------------------ #
+    async def _settle_dial(self, wait_for_answer: bool, ring_timeout: float) -> str:
+        """Let the dial land and return the call state.
+
+        A blocked microphone means Google Voice never dialed at all, so that is
+        an error whether or not the caller asked us to wait for an answer.
+        Otherwise it would surface as a bogus 'completed' or 'no-answer'.
+        """
+        if wait_for_answer:
+            state = await self._await_answer(ring_timeout)
+        else:
+            await self._sleep(2)  # let the call panel render
+            state = await self._call_state()
+        if state == 'mic-blocked':
+            await self._hangup()
+            raise APIError(
+                'Chrome did not grant microphone access, so Google Voice '
+                'never placed the call. Grant the mic to voice.google.com '
+                'in this profile, or pass '
+                "extra_browser_args=['--use-fake-ui-for-media-stream']."
+            )
+        return state
+
     async def _call_state(self) -> str:
         """Classify the live call.
 
