@@ -128,7 +128,7 @@ auto-confirms from the saved profile and retries; disable with
 
 Sending an SMS is gated by Google behind anti-abuse tokens (reCAPTCHA +
 BotGuard) that can only be produced in a browser, so it is done by driving the
-real web app (which reuses the profile from ``login``):
+real web app:
 
 .. code-block:: python
 
@@ -140,6 +140,11 @@ real web app (which reuses the profile from ``login``):
 
 Or from the command line: ``python -m googlevoice send +12085551234 "hi"``
 (comma-separate the numbers for a group message).
+
+The browser signs in from your saved ``session.json``, so it works on any
+machine that has the session file and Chrome, and never asks you to log in
+again while the session is valid. It also refreshes ``session.json`` when it
+closes.
 
 
 How it works

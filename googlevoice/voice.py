@@ -184,7 +184,9 @@ class Voice:
     # ----------------------------------------------------------------- #
     # Low-level call
     # ----------------------------------------------------------------- #
-    def _call(self, endpoint: str, body: Any, *, alt: str = 'json', _retried=False) -> Any:
+    def _call(
+        self, endpoint: str, body: Any, *, alt: str = 'json', _retried=False
+    ) -> Any:
         """POST ``body`` (a JSON-able protojson array) to ``endpoint``."""
         resp = self._http.post(
             API_BASE + endpoint,
@@ -218,7 +220,7 @@ class Voice:
             self.credentials = auth.browser_login(
                 self._session_path, self._profile_dir, timeout=120
             )
-        except Exception as err:  # nodriver missing, profile signed out, etc.
+        except Exception as err:  # noqa: BLE001 - nodriver missing, signed out, etc.
             log.warning('auto re-login failed: %s', err)
             return False
         self._http = self.credentials.requests_session()
@@ -274,9 +276,7 @@ class Voice:
         """Spam conversations (all kinds). Clear with :meth:`mark_not_spam`."""
         return self.threads(Folder.SPAM, count)
 
-    def thread(
-        self, recipient: str, *, messages: int = 100
-    ) -> util.Thread | None:
+    def thread(self, recipient: str, *, messages: int = 100) -> util.Thread | None:
         """
         Return the single conversation with ``recipient`` (a number this library
         can normalize, or a thread id), with up to ``messages`` recent messages,
@@ -307,21 +307,24 @@ class Voice:
     def missed(self, count: int = 20) -> list[util.Message]:
         """Missed-call records."""
         return [
-            m for m in self._messages(Folder.CALLS, count)
+            m
+            for m in self._messages(Folder.CALLS, count)
             if m.type == MessageType.MISSED or m.coarse_type == CoarseType.MISSED
         ]
 
     def placed(self, count: int = 20) -> list[util.Message]:
         """Outgoing (placed) call records."""
         return [
-            m for m in self._messages(Folder.CALLS, count)
+            m
+            for m in self._messages(Folder.CALLS, count)
             if m.coarse_type == CoarseType.PLACED
         ]
 
     def received(self, count: int = 20) -> list[util.Message]:
         """Answered incoming-call records."""
         return [
-            m for m in self._messages(Folder.CALLS, count)
+            m
+            for m in self._messages(Folder.CALLS, count)
             if m.coarse_type == CoarseType.RECEIVED
         ]
 

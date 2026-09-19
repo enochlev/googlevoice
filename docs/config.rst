@@ -41,5 +41,10 @@ Sending
 Reading is browser-free, but **sending** SMS is gated by Google behind
 anti-abuse tokens (reCAPTCHA + BotGuard) that can only be produced in a
 browser. :class:`googlevoice.browser.BrowserSender` therefore drives the real
-web app to send, reusing the signed-in browser profile from ``login``. Sending
-thus requires Chrome to be installed on the sending machine.
+web app to send. Sending thus requires Chrome to be installed on the sending
+machine.
+
+The browser signs in from the saved ``session.json`` (Chrome forgets Google's
+login cookies whenever it exits cleanly, so the browser profile alone cannot
+keep you signed in). While the session is valid you are never asked to log in
+again, and the session file is refreshed each time the browser closes.

@@ -17,28 +17,34 @@ Usage::
     with BrowserSender() as sender:           # reuses ~/.googlevoice/chrome-profile
         sender.send_sms('+12085551234', 'Hello from Python!')
 
-The profile must already be signed in -- run ``python -m googlevoice.auth
-login`` once first. Sending therefore needs Chrome installed and running;
-reading does not.
+Sign in once with ``python -m googlevoice login``. The browser signs in from
+the saved ``session.json`` whenever its profile has been signed out (Chrome
+drops the login cookies on a clean exit), and refreshes that file on close.
+Sending therefore needs Chrome installed and running; reading does not.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from ._browserlock import BrowserBusyError, ProfileLock
 from .auth import (
     DEFAULT_DIR,
     DEFAULT_PROFILE_DIR,
+    DEFAULT_SESSION_PATH,
     ORIGIN,
     browser_launch_args,
+    close_browser,
+    ensure_signed_in,
     headless_default,
+    refresh_session,
 )
-from .util import APIError, LoginError
+from .util import APIError
 from .voice import normalize_number
 
 # Re-exported so callers can ``from googlevoice.browser import BrowserBusyError``.
-__all__ = ['BrowserSender', 'BrowserBusyError', 'capture_api_calls']
+__all__ = ['BrowserBusyError', 'BrowserSender', 'capture_api_calls']
 
 log = logging.getLogger(__name__)
 
@@ -77,19 +83,23 @@ window.__gv = (function () {
 class BrowserSender:
     """
     Sends Google Voice SMS by driving the real web app in a Chrome instance
-    (via ``nodriver``). Reuses the signed-in profile created by
-    ``python -m googlevoice.auth login``.
+    (via ``nodriver``). Reuses the profile created by ``python -m googlevoice
+    login`` and, when that profile has been signed out, signs in again from the
+    saved ``session_path`` (``None`` disables this and requires a signed-in
+    profile).
     """
 
     def __init__(
         self,
         profile_dir=DEFAULT_PROFILE_DIR,
         *,
+        session_path=DEFAULT_SESSION_PATH,
         headless: bool | None = None,
         timeout: float = 60,
         wait: bool = False,
     ):
         self.profile_dir = profile_dir
+        self.session_path = session_path
         # headless=None -> auto: headed if a display is available, else headless
         # (a headed Chrome can't start on a display-less server/container).
         self.headless = headless_default() if headless is None else headless
@@ -101,6 +111,7 @@ class BrowserSender:
         self._tab = None
         self._loop = None
         self._lock = None
+        self._signed_in = False
         self._statuses: list[int] = []
 
     # ------------------------------------------------------------------ #
@@ -144,24 +155,32 @@ class BrowserSender:
 
         self._tab.add_handler(cdp.network.ResponseReceived, _on_response)
         await self._tab.send(cdp.network.enable())
-        await self._sleep(4)
 
-        url = await self._tab.evaluate('location.href', await_promise=False)
-        if 'voice.google.com' not in (url or '') or 'workspace.google.com' in (
-            url or ''
-        ):
-            raise LoginError(
-                'Browser profile is not signed in to Google Voice. '
-                'Run `python -m googlevoice.auth login` first.'
-            )
+        # Signed-out profile -> sign in from session.json; raises LoginError
+        # if neither works.
+        await ensure_signed_in(self._browser, self._tab, session_path=self.session_path)
+        self._signed_in = True
 
     def close(self) -> None:
         if self._browser is not None:
-            self._browser.stop()
-            self._browser = self._tab = None
+            browser, self._browser, self._tab = self._browser, None, None
+            try:
+                self._loop.run_until_complete(self._shutdown(browser))
+            except Exception as err:  # noqa: BLE001 - teardown must not mask the real error
+                log.debug('graceful shutdown failed (%s); terminating', err)
+                with contextlib.suppress(Exception):
+                    browser.stop()
         if self._lock is not None:
             self._lock.release()
             self._lock = None
+
+    async def _shutdown(self, browser) -> None:
+        # Keep the portable session current with Google's rotated cookies, then
+        # let Chrome quit cleanly so the profile is written out.
+        if self._signed_in and self.session_path is not None:
+            with contextlib.suppress(Exception):
+                await refresh_session(browser, self.session_path)
+        await close_browser(browser)
 
     # ------------------------------------------------------------------ #
     # sending
@@ -219,7 +238,7 @@ class BrowserSender:
         """Evaluate ``expr``; reinstall the JS helpers and retry once if needed."""
         try:
             return await self._tab.evaluate(expr, await_promise=False)
-        except Exception:
+        except Exception:  # noqa: BLE001 - a navigation wipes the helpers; reinstall
             await self._tab.evaluate(_HELPERS_JS, await_promise=False)
             return await self._tab.evaluate(expr, await_promise=False)
 
@@ -357,8 +376,18 @@ async def _capture_async(profile_dir, *, seconds, headless, out_path) -> list[di
         tab = await browser.get(ORIGIN)
 
         static_ext = (
-            '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff',
-            '.woff2', '.ico', '.webp', '.map',
+            '.js',
+            '.css',
+            '.png',
+            '.jpg',
+            '.jpeg',
+            '.gif',
+            '.svg',
+            '.woff',
+            '.woff2',
+            '.ico',
+            '.webp',
+            '.map',
         )
 
         def _on_request(ev):
@@ -370,8 +399,12 @@ async def _capture_async(profile_dir, *, seconds, headless, out_path) -> list[di
             if any(
                 s in url
                 for s in (
-                    'gstatic.com', 'google-analytics.com', '/gen_204',
-                    '/jserror', '/ulog', 'play.google.com/log',
+                    'gstatic.com',
+                    'google-analytics.com',
+                    '/gen_204',
+                    '/jserror',
+                    '/ulog',
+                    'play.google.com/log',
                 )
             ):
                 return  # telemetry / analytics
@@ -411,8 +444,11 @@ async def _capture_async(profile_dir, *, seconds, headless, out_path) -> list[di
             try:
                 other.add_handler(cdp.network.RequestWillBeSent, _on_request)
                 await other.send(cdp.network.enable(max_post_data_size=1 << 20))
-            except Exception as err:  # not all targets support Network
+            except Exception as err:  # noqa: BLE001 - not all targets support Network
                 log.debug('skip target %s: %s', other, err)
+
+        # A signed-out profile records nothing useful; sign in from session.json.
+        await ensure_signed_in(browser, tab)
 
         print(
             f'>>> Recording voiceclient calls to {out_path} for {seconds:.0f}s.',
@@ -424,7 +460,7 @@ async def _capture_async(profile_dir, *, seconds, headless, out_path) -> list[di
         )
         await asyncio.sleep(seconds)
     finally:
-        browser.stop()
+        await close_browser(browser)
         sink.close()
     print(f'>>> Captured {len(calls)} call(s).', flush=True)
     return calls

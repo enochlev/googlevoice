@@ -102,7 +102,9 @@ class ProfileLock:
             return
         lockpath = self.profile_dir / '.googlevoice.lock'
         lockpath.touch(exist_ok=True)  # 'r+' (don't truncate -- preserves holder pid)
-        self._fh = open(lockpath, 'r+')
+        # Held open for the lock's whole life (released in release()), so a
+        # context manager would be wrong here.
+        self._fh = open(lockpath, 'r+')  # noqa: SIM115
         start = time.monotonic()
         while True:
             try:

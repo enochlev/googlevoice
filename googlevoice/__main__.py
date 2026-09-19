@@ -74,7 +74,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_inbox = sub.add_parser('inbox', help='List recent conversations')
     p_inbox.add_argument(
-        '-n', '--count', type=int, default=20, help='how many conversations (default 20)'
+        '-n',
+        '--count',
+        type=int,
+        default=20,
+        help='how many conversations (default 20)',
     )
     p_inbox.add_argument('--json', action='store_true', help='machine-readable output')
 
@@ -110,7 +114,9 @@ def _build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(verb, help=spec[1])
         p.add_argument('number', help='Conversation, e.g. +12085551234')
 
-    p_dl = sub.add_parser('download', help='Download voicemail audio from a conversation')
+    p_dl = sub.add_parser(
+        'download', help='Download voicemail audio from a conversation'
+    )
     p_dl.add_argument('number', help='Conversation, e.g. +12085551234')
     p_dl.add_argument('--dir', default='.', help='destination directory (default .)')
 
@@ -211,7 +217,9 @@ def _cmd_voicemail(args) -> None:
 
 
 def _cmd_calls(args) -> None:
-    msgs = getattr(Voice(), args.type)(count=args.count)  # missed/placed/received/recorded
+    msgs = getattr(Voice(), args.type)(
+        count=args.count
+    )  # missed/placed/received/recorded
     _print_messages(msgs, args.json)
 
 

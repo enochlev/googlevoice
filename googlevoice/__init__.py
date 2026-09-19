@@ -12,4 +12,4 @@ from .auth import Credentials
 from .util import Message, Thread
 from .voice import Voice
 
-__all__ = ['Voice', 'Credentials', 'Thread', 'Message']
+__all__ = ['Credentials', 'Message', 'Thread', 'Voice']

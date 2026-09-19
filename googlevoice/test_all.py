@@ -1,15 +1,18 @@
+import asyncio
 import json
 import os
 import re
+import time
+import types
 
 import pytest
 import responses
 
-from googlevoice import Credentials, Voice
+from googlevoice import Credentials, Voice, auth
 from googlevoice import _browserlock as bl
 from googlevoice.__main__ import main
 from googlevoice.auth import API_BASE, load_session, sapisid_hash, save_session
-from googlevoice.util import Message, Thread
+from googlevoice.util import LoginError, Message, Thread
 from googlevoice.voice import Folder, _thread_id_for, normalize_number
 
 FAKE_COOKIES = [
@@ -401,3 +404,257 @@ class TestCLI:
         data = json.loads(capsys.readouterr().out)
         assert data[0]['id'] == 't.+12085550000'
         assert data[0]['messages'][0]['text'] == 'hello there'
+
+
+# --------------------------------------------------------------------------- #
+# Browser session helpers -- exercised against fakes standing in for nodriver's
+# Tab/Browser (real CDP command objects, no Chrome).
+# --------------------------------------------------------------------------- #
+VOICE_URL = 'https://voice.google.com/u/0/messages'
+SIGNED_OUT_URL = 'https://workspace.google.com/products/voice/'
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _browser_cookie(name, domain='.google.com', expires=-1, **extra):
+    """A stand-in for ``cdp.network.Cookie`` as ``browser.cookies.get_all()`` yields."""
+    base = {
+        'name': name,
+        'value': f'{name}-val',
+        'domain': domain,
+        'path': '/',
+        'secure': True,
+        'http_only': True,
+        'same_site': None,
+        'expires': expires,
+    }
+    base.update(extra)
+    return types.SimpleNamespace(**base)
+
+
+class FakeTab:
+    """Records the CDP commands sent and the navigations made."""
+
+    def __init__(self, urls=()):
+        self.urls = list(urls)  # what settled_url should report, in order
+        self.sent = []  # decoded CDP requests ({'method', 'params'})
+        self.gets = []
+
+    async def send(self, cmd):
+        request = next(cmd)  # a CDP command is a generator yielding its request
+        self.sent.append(request)
+        try:
+            cmd.send({'success': True})
+        except StopIteration as stop:
+            return stop.value
+        return None
+
+    async def get(self, url):
+        self.gets.append(url)
+
+    def params(self, method):
+        return [r['params'] for r in self.sent if r['method'] == method]
+
+
+class FakeBrowser:
+    def __init__(self, cookies=(), *, close_ok=True):
+        self._cookies = list(cookies)
+        self.cookies = types.SimpleNamespace(get_all=self._get_all)
+        self.close_ok = close_ok
+        self.stopped = False
+        self.closed = False
+        self.sent = []
+        self._process = types.SimpleNamespace(wait=self._wait)
+        self._process_pid = 4242
+
+    async def _get_all(self):
+        return self._cookies
+
+    async def _wait(self):
+        return 0
+
+    async def send(self, cmd):
+        if not self.close_ok:
+            raise ConnectionError('CDP gone')
+        self.sent.append(next(cmd))
+
+    async def aclose(self):
+        self.closed = True
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.fixture
+def scripted_urls(monkeypatch):
+    """Make ``settled_url`` report the tab's scripted URLs instead of polling."""
+
+    async def fake_settled(tab, **_):
+        return tab.urls.pop(0) if len(tab.urls) > 1 else tab.urls[0]
+
+    monkeypatch.setattr(auth, 'settled_url', fake_settled)
+
+
+class TestBrowserSession:
+    @pytest.mark.parametrize(
+        ('url', 'expected'),
+        [
+            (VOICE_URL, True),
+            ('https://voice.google.com/', True),
+            ('https://voice.google.com/about', False),
+            ('https://voice.google.com/about/', False),
+            (SIGNED_OUT_URL, False),
+            ('https://accounts.google.com/v3/signin/identifier?x=1', False),
+            ('', False),
+            (None, False),
+        ],
+    )
+    def test_is_signed_in_url(self, url, expected):
+        assert auth.is_signed_in_url(url) is expected
+
+    def test_settled_url_waits_out_redirects(self):
+        states = iter([
+            'loading https://voice.google.com/',
+            'complete https://voice.google.com/',
+            'complete https://accounts.google.com/x',
+            'complete https://accounts.google.com/x',
+            'complete never-reached',
+        ])
+        tab = types.SimpleNamespace()
+
+        async def evaluate(expr, await_promise=False):
+            return next(states)
+
+        tab.evaluate = evaluate
+        assert _run(auth.settled_url(tab, poll=0)) == 'https://accounts.google.com/x'
+
+    def test_inject_cookies_pins_session_cookies_and_skips_expired(self):
+        now = time.time()
+        cookies = [
+            # session cookie on a domain -> pinned with an expiry, Domain kept
+            {'name': 'SID', 'value': 's', 'domain': '.google.com', 'expires': -1},
+            # persistent -> expiry preserved
+            {
+                'name': 'NID',
+                'value': 'n',
+                'domain': '.google.com',
+                'path': '/',
+                'expires': now + 100,
+                'same_site': 'None',
+                'secure': True,
+            },
+            # host-only -> set via URL, no Domain attribute (``__Host-`` rule)
+            {
+                'name': '__Host-GAPS',
+                'value': 'g',
+                'domain': 'accounts.google.com',
+                'path': '/',
+                'expires': None,
+            },
+            # already expired -> skipped entirely
+            {'name': 'OLD', 'value': 'o', 'domain': '.google.com', 'expires': now - 5},
+        ]
+        tab = FakeTab()
+        assert _run(auth.inject_cookies(tab, cookies, ttl=1000)) == 3
+        by_name = {p['name']: p for p in tab.params('Network.setCookie')}
+        assert set(by_name) == {'SID', 'NID', '__Host-GAPS'}
+        assert by_name['SID']['domain'] == '.google.com'
+        assert now + 900 < float(by_name['SID']['expires']) <= now + 1100
+        assert float(by_name['NID']['expires']) == pytest.approx(now + 100)
+        assert by_name['NID']['sameSite'] == 'None'
+        assert 'domain' not in by_name['__Host-GAPS']
+        assert by_name['__Host-GAPS']['url'] == 'https://accounts.google.com/'
+        assert float(by_name['__Host-GAPS']['expires']) > now
+
+    def test_ensure_signed_in_uses_profile_when_already_signed_in(
+        self, scripted_urls, tmp_path
+    ):
+        tab = FakeTab([VOICE_URL])
+        landed = _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=tmp_path))
+        assert landed == VOICE_URL
+        assert tab.sent == [] and tab.gets == []
+
+    def test_ensure_signed_in_injects_saved_session_and_reloads(
+        self, scripted_urls, tmp_path
+    ):
+        session = save_session(FAKE_COOKIES, tmp_path / 'session.json')
+        tab = FakeTab([SIGNED_OUT_URL, VOICE_URL])
+        landed = _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=session))
+        assert landed == VOICE_URL
+        assert tab.gets == [auth.ORIGIN]  # reloaded after injecting
+        names = {p['name'] for p in tab.params('Network.setCookie')}
+        assert names == {c['name'] for c in FAKE_COOKIES}
+
+    def test_ensure_signed_in_without_session_file(self, scripted_urls, tmp_path):
+        tab = FakeTab([SIGNED_OUT_URL])
+        with pytest.raises(LoginError, match='googlevoice login'):
+            _run(
+                auth.ensure_signed_in(
+                    FakeBrowser(), tab, session_path=tmp_path / 'missing.json'
+                )
+            )
+        assert tab.gets == []
+
+    def test_ensure_signed_in_when_saved_session_is_dead(self, scripted_urls, tmp_path):
+        session = save_session(FAKE_COOKIES, tmp_path / 'session.json')
+        tab = FakeTab([SIGNED_OUT_URL, SIGNED_OUT_URL])
+        with pytest.raises(LoginError, match='no longer works'):
+            _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=session))
+
+    def test_ensure_signed_in_profile_only_mode(self, scripted_urls, tmp_path):
+        tab = FakeTab([SIGNED_OUT_URL])
+        with pytest.raises(LoginError):
+            _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=None))
+        assert tab.sent == []
+
+    def test_harvest_keeps_google_cookies_only(self):
+        browser = FakeBrowser([
+            _browser_cookie('SID'),
+            _browser_cookie('other', domain='.example.com'),
+            _browser_cookie('__Host-GAPS', domain='accounts.google.com', expires=5.0),
+        ])
+        got = _run(auth.harvest_cookies(browser))
+        assert [c['name'] for c in got] == ['SID', '__Host-GAPS']
+        assert got[0]['expires'] == -1 and got[0]['http_only'] is True
+        assert got[1]['domain'] == 'accounts.google.com'
+
+    def test_refresh_session_requires_essential_cookies(self, tmp_path):
+        path = tmp_path / 'session.json'
+        partial = FakeBrowser([_browser_cookie('SID')])
+        assert _run(auth.refresh_session(partial, path)) is False
+        assert not path.exists()
+        full = FakeBrowser([_browser_cookie(n) for n in auth.ESSENTIAL_COOKIES])
+        assert _run(auth.refresh_session(full, path)) is True
+        assert {c['name'] for c in load_session(path)} == auth.ESSENTIAL_COOKIES
+
+    def test_close_browser_prefers_graceful_close(self):
+        browser = FakeBrowser()
+        _run(auth.close_browser(browser))
+        assert browser.sent[0]['method'] == 'Browser.close'
+        assert browser.closed and not browser.stopped
+        assert browser._process is None
+
+    def test_close_browser_falls_back_to_stop(self):
+        browser = FakeBrowser(close_ok=False)
+        _run(auth.close_browser(browser))
+        assert browser.stopped
+
+    def test_sender_close_refreshes_session_then_quits(self, tmp_path):
+        from googlevoice.browser import BrowserSender
+
+        path = tmp_path / 'session.json'
+        sender = BrowserSender(tmp_path / 'profile', session_path=path)
+        sender._loop = asyncio.new_event_loop()
+        sender._browser = FakeBrowser([
+            _browser_cookie(n) for n in auth.ESSENTIAL_COOKIES
+        ])
+        sender._tab = object()
+        sender._signed_in = True
+        browser = sender._browser
+        sender.close()
+        assert sender._browser is None and sender._tab is None
+        assert path.exists()  # rotated cookies saved for next time
+        assert browser.sent[0]['method'] == 'Browser.close'
+        sender._loop.close()
