@@ -76,36 +76,44 @@ along, and a request to call back -- and only then end the call.
 confirmation codes). If you don't know something, say you'll follow up.
 - CRITICAL: never call ``end_call`` until you have actually SPOKEN the complete \
 message you were asked to convey (and asked any question in the goal). Do not \
-hang up just because you heard a greeting or "please leave a message". When the \
-goal is truly done -- or the person wants to hang up -- say goodbye out loud, \
-THEN call ``end_call``.
+hang up just because you heard a greeting or "please leave a message". The goal \
+above says what counts as done; judge it honestly, and report it in \
+``end_call``'s ``goal_met`` and ``summary``. When the goal is truly done -- or \
+the person wants to hang up -- say goodbye out loud, THEN call ``end_call``.
 
 Speak English unless the other person clearly prefers another language.\
 """
 
-# Normal hang-up: only honored once the mission is actually done. The agent
-# must report what the caller really gave -- the bridge double-checks and will
-# refuse (and push it to keep going) if the rating or friendship is missing.
+# Normal hang-up: only honored once the goal is actually met. What "met" means
+# is whatever the goal text says, so the agent judges it and reports back; the
+# bridge refuses (and pushes it to keep going) while the answer is no.
 END_CALL_TOOL = {
     'type': 'function',
     'name': 'end_call',
     'description': (
-        "Hang up. Call this ONLY after the caller has BOTH given a 1-10 rating "
-        "AND confirmed you're friends. Report honestly what they actually said."
+        'Hang up. Call this ONLY once the goal of this call has actually been '
+        'met and you have said goodbye out loud. Report honestly what happened, '
+        'even if the goal was not met.'
     ),
     'parameters': {
         'type': 'object',
         'properties': {
-            'rating': {
-                'type': 'integer',
-                'description': 'The 1-10 rating the caller actually gave; 0 if none yet.',
-            },
-            'friends_confirmed': {
+            'goal_met': {
                 'type': 'boolean',
-                'description': 'True ONLY if the caller actually agreed you are friends.',
+                'description': (
+                    'True ONLY if the goal was genuinely achieved on this call, '
+                    'by the standard the goal itself sets.'
+                ),
+            },
+            'summary': {
+                'type': 'string',
+                'description': (
+                    'One or two sentences on what the other party actually said '
+                    'or agreed to, and anything still outstanding.'
+                ),
             },
         },
-        'required': ['rating', 'friends_confirmed'],
+        'required': ['goal_met', 'summary'],
     },
 }
 
@@ -172,6 +180,9 @@ class RealtimeBridge:
         self.key = key or openai_key()
         self._done = asyncio.Event()
         self.transcript: list[tuple[str, str]] = []  # (speaker, text)
+        # What the agent reported when it finally hung up.
+        self.goal_met = False
+        self.end_summary = ''
         self._nudges = 0  # times we've refused a premature end_call
 
     async def __call__(self, caller: Caller) -> None:
@@ -334,31 +345,28 @@ class RealtimeBridge:
             await self._on_end_call(ev, ws)
 
     async def _on_end_call(self, ev: dict, ws) -> None:
-        """Honor end_call only once the mission is truly done.
+        """Honor end_call only once the goal is truly met.
 
-        The model decides when to hang up, but we double-check the values it
-        reports: a real 1-10 rating AND a friendship confirmation. If either is
-        missing we refuse and push it to keep going (up to MAX_NUDGES), so it
-        can't bail early after a curt or garbled reply. ``abort_call`` remains
-        the always-honored exit for genuine distress.
+        The goal text states its own completion criteria (see :func:`load_goal`),
+        so the model judges them and reports ``goal_met`` plus a short summary.
+        While that is false we refuse and push it to keep going, up to
+        ``MAX_NUDGES``, so it can't bail early after a curt or garbled reply.
+        ``abort_call`` remains the always-honored exit for genuine distress.
         """
         try:
             args = json.loads(ev.get('arguments') or '{}')
         except (TypeError, ValueError):
             args = {}
-        rating = args.get('rating')
-        has_rating = isinstance(rating, int) and 1 <= rating <= 10
-        friends = bool(args.get('friends_confirmed'))
+        goal_met = bool(args.get('goal_met'))
+        summary = str(args.get('summary') or '').strip()
 
-        if (not has_rating or not friends) and self._nudges < MAX_NUDGES:
+        if not goal_met and self._nudges < MAX_NUDGES:
             self._nudges += 1
-            missing = []
-            if not has_rating:
-                missing.append('a real 1-to-10 rating from them')
-            if not friends:
-                missing.append('them to actually confirm you two are friends')
-            need = ' and '.join(missing)
-            log.info('end_call refused (still need %s); nudge %d', need, self._nudges)
+            log.info(
+                'end_call refused, goal not met (%s); nudge %d',
+                summary or 'no reason reported',
+                self._nudges,
+            )
             call_id = ev.get('call_id')
             if call_id:
                 await ws.send(
@@ -367,7 +375,10 @@ class RealtimeBridge:
                         'item': {
                             'type': 'function_call_output',
                             'call_id': call_id,
-                            'output': json.dumps({'ok': False, 'still_need': need}),
+                            'output': json.dumps({
+                                'ok': False,
+                                'reason': 'the goal of this call is not met yet',
+                            }),
                         },
                     })
                 )
@@ -376,17 +387,19 @@ class RealtimeBridge:
                     'type': 'response.create',
                     'response': {
                         'instructions': (
-                            f"Do NOT hang up yet -- you still need {need}. Stay "
-                            'warm, upbeat and playful, keep the conversation '
-                            'going, and work toward it. Only use end_call once '
-                            'you genuinely have both; use abort_call only if they '
-                            'are truly upset or insist on going.'
+                            'Do NOT hang up yet -- the goal of this call is not '
+                            'met. Stay warm and natural, keep the conversation '
+                            'going, and work toward the goal. Only use end_call '
+                            'once it is genuinely met; use abort_call only if '
+                            'they are truly upset or insist on going.'
                         )
                     },
                 })
             )
             return
-        log.info('agent ended the call (rating=%s, friends=%s)', rating, friends)
+        self.goal_met = goal_met
+        self.end_summary = summary
+        log.info('agent ended the call (goal_met=%s): %s', goal_met, summary or '-')
         asyncio.create_task(self._end_after(2.5))
 
     async def _end_after(self, delay: float) -> None:
@@ -502,6 +515,10 @@ def place_realtime_call(
     finally:
         destroy_sink('gv_mic')
         destroy_sink('gv_spk')
+
+    if bridge.end_summary:
+        met = 'met' if bridge.goal_met else 'NOT met'
+        print(f'\n=== The agent reports the goal {met} ===\n{bridge.end_summary}')
 
     try:
         summary = summarize_call(goal, bridge.transcript, model=summary_model, key=key)

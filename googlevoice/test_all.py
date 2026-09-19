@@ -715,3 +715,65 @@ class TestBrowserSession:
         assert path.exists()  # rotated cookies saved for next time
         assert browser.sent[0]['method'] == 'Browser.close'
         sender._loop.close()
+
+
+class TestRealtimeEndCall:
+    """The end_call tool is goal-agnostic: the goal text sets its own bar."""
+
+    class FakeWS:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+    def _bridge(self):
+        from googlevoice.realtime import RealtimeBridge
+
+        return RealtimeBridge('get a callback scheduled', key='test-key')
+
+    def _event(self, **args):
+        return {'call_id': 'c1', 'arguments': json.dumps(args)}
+
+    def test_tool_schema_is_generic(self):
+        from googlevoice.realtime import END_CALL_TOOL
+
+        props = END_CALL_TOOL['parameters']['properties']
+        assert set(props) == {'goal_met', 'summary'}
+        assert END_CALL_TOOL['parameters']['required'] == ['goal_met', 'summary']
+        # No persona left in the code.
+        assert 'rating' not in json.dumps(END_CALL_TOOL).lower()
+        assert 'friend' not in json.dumps(END_CALL_TOOL).lower()
+
+    def test_goal_met_ends_the_call(self):
+        bridge, ws = self._bridge(), self.FakeWS()
+        ev = self._event(goal_met=True, summary='They agreed.')
+        _run(bridge._on_end_call(ev, ws))
+        assert bridge.goal_met is True
+        assert bridge.end_summary == 'They agreed.'
+        assert bridge._nudges == 0
+        assert ws.sent == []  # honored: nothing pushed back at the model
+
+    def test_goal_not_met_nudges_instead(self):
+        bridge, ws = self._bridge(), self.FakeWS()
+        ev = self._event(goal_met=False, summary='No answer yet')
+        _run(bridge._on_end_call(ev, ws))
+        assert bridge._nudges == 1
+        assert bridge.goal_met is False
+        kinds = [m['type'] for m in ws.sent]
+        assert kinds == ['conversation.item.create', 'response.create']
+        assert json.loads(ws.sent[0]['item']['output'])['ok'] is False
+
+    def test_nudging_relents_after_max(self):
+        from googlevoice.realtime import MAX_NUDGES
+
+        bridge, ws = self._bridge(), self.FakeWS()
+        bridge._nudges = MAX_NUDGES
+        _run(bridge._on_end_call(self._event(goal_met=False, summary='gave up'), ws))
+        assert ws.sent == []  # relented; the call is allowed to end
+        assert bridge.end_summary == 'gave up'
+
+    def test_malformed_arguments_are_treated_as_not_met(self):
+        bridge, ws = self._bridge(), self.FakeWS()
+        _run(bridge._on_end_call({'call_id': 'c1', 'arguments': 'not json'}, ws))
+        assert bridge._nudges == 1
