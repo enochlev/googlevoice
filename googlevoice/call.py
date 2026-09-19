@@ -21,20 +21,32 @@ Usage::
     with Caller(audio_wav='test.wav') as caller:   # reuses ~/.googlevoice/chrome-profile
         caller.place_call('+12085550123')
 
-The profile must already be signed in -- run ``python -m googlevoice.auth
-login`` once first. A later phase swaps the static WAV for a live virtual
-microphone (e.g. to bridge a realtime voice model into the call).
+Sign in once with ``python -m googlevoice login``; after that the saved
+``session.json`` signs the browser back in whenever the Chrome profile has been
+signed out, and is refreshed when the browser closes. A later phase swaps the
+static WAV for a live virtual microphone (e.g. to bridge a realtime voice model
+into the call).
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 
 from ._browserlock import ProfileLock
-from .auth import DEFAULT_PROFILE_DIR, ORIGIN
+from .auth import (
+    DEFAULT_PROFILE_DIR,
+    DEFAULT_SESSION_PATH,
+    ORIGIN,
+    browser_launch_args,
+    close_browser,
+    ensure_signed_in,
+    headless_default,
+    refresh_session,
+)
 from .browser import _HELPERS_JS
-from .util import APIError, LoginError
+from .util import APIError
 from .voice import normalize_number
 
 log = logging.getLogger(__name__)
@@ -91,8 +103,10 @@ _CALL_HELPERS_JS = r"""
 class Caller:
     """
     Places Google Voice calls by driving the real web app in a Chrome instance
-    (via ``nodriver``). Reuses the signed-in profile created by
-    ``python -m googlevoice.auth login``.
+    (via ``nodriver``). Reuses the profile created by ``python -m googlevoice
+    login`` and, when that profile has been signed out, signs in again from the
+    saved ``session_path`` (``None`` disables this and requires a signed-in
+    profile).
 
     :class:`Caller` only dials and tracks call state. Call audio is layered on
     top via the ``on_connected`` hook of :meth:`place_call`, which streams audio
@@ -106,20 +120,24 @@ class Caller:
         self,
         profile_dir=DEFAULT_PROFILE_DIR,
         *,
+        session_path=DEFAULT_SESSION_PATH,
         extra_browser_args: list[str] | None = None,
         init_script: str | None = None,
-        headless: bool = False,
+        headless: bool | None = None,
         timeout: float = 120,
         wait: bool = False,
     ):
         self.profile_dir = profile_dir
+        self.session_path = session_path
         # Extra Chrome flags (e.g. '--use-fake-ui-for-media-stream' to auto-grant
         # the mic with real devices for live audio routing).
         self.extra_browser_args = list(extra_browser_args or [])
         # JS run at the start of every document (used to disable WebRTC mic
         # processing, which otherwise mangles injected audio).
         self.init_script = init_script
-        self.headless = headless
+        # headless=None -> auto: headed if a display is available. A call needs
+        # real audio devices, so headless is rarely what you want here.
+        self.headless = headless_default() if headless is None else headless
         self.timeout = timeout
         # wait=False -> raise BrowserBusyError if the profile is busy;
         # wait=True -> queue until it frees up.
@@ -128,6 +146,7 @@ class Caller:
         self._tab = None
         self._loop = None
         self._lock = None
+        self._signed_in = False
         self._call_events: list[str] = []
 
     # ------------------------------------------------------------------ #
@@ -157,16 +176,26 @@ class Caller:
         import nodriver as uc
         from nodriver import cdp
 
-        args = [
-            '--no-first-run',
-            '--no-default-browser-check',
-            *self.extra_browser_args,
-        ]
         self._browser = await uc.start(
             headless=self.headless,
             user_data_dir=str(self.profile_dir),
-            browser_args=args,
+            browser_args=[*browser_launch_args(), *self.extra_browser_args],
         )
+
+        # A call is WebRTC, so Google Voice asks for the microphone. Left to
+        # itself Chrome shows an "Allow mic access" prompt inside the call
+        # panel and the call silently never goes out -- the panel sits on
+        # "Ongoing call" forever and the callee's phone never rings. Grant the
+        # permission up front, for the profile's default context.
+        try:
+            await self._browser.send(
+                cdp.browser.grant_permissions(
+                    permissions=[cdp.browser.PermissionType.AUDIO_CAPTURE],
+                    origin=ORIGIN,
+                )
+            )
+        except Exception as err:  # noqa: BLE001 - not fatal; the call may still work
+            log.warning('could not pre-grant microphone access (%s)', err)
 
         # Register the init script on the initial tab BEFORE loading any Google
         # Voice page, so it's in place before the page calls getUserMedia.
@@ -190,22 +219,36 @@ class Caller:
         await self._tab.send(cdp.network.enable())
         await self._sleep(4)
 
-        url = await self._tab.evaluate('location.href', await_promise=False)
-        if 'voice.google.com' not in (url or '') or 'workspace.google.com' in (
-            url or ''
-        ):
-            raise LoginError(
-                'Browser profile is not signed in to Google Voice. '
-                'Run `python -m googlevoice.auth login` first.'
-            )
+        # Signed-out profile -> sign in from session.json; raises LoginError if
+        # neither the profile nor the saved session works.
+        await ensure_signed_in(
+            self._browser,
+            self._tab,
+            session_path=self.session_path,
+            url=f'{ORIGIN}/u/0/calls',
+        )
+        self._signed_in = True
 
     def close(self) -> None:
         if self._browser is not None:
-            self._browser.stop()
-            self._browser = self._tab = None
+            browser, self._browser, self._tab = self._browser, None, None
+            try:
+                self._loop.run_until_complete(self._shutdown(browser))
+            except Exception as err:  # noqa: BLE001 - teardown must not mask the real error
+                log.debug('graceful shutdown failed (%s); terminating', err)
+                with contextlib.suppress(Exception):
+                    browser.stop()
         if self._lock is not None:
             self._lock.release()
             self._lock = None
+
+    async def _shutdown(self, browser) -> None:
+        # Keep the portable session current with Google's rotated cookies, then
+        # let Chrome quit cleanly so the profile keeps its login.
+        if self._signed_in and self.session_path is not None:
+            with contextlib.suppress(Exception):
+                await refresh_session(browser, self.session_path)
+        await close_browser(browser)
 
     # ------------------------------------------------------------------ #
     # calling
@@ -317,6 +360,14 @@ class Caller:
         # 3. wait through ringing until the line connects (or give up)
         if wait_for_answer:
             state = await self._await_answer(ring_timeout)
+            if state == 'mic-blocked':
+                await self._hangup()
+                raise APIError(
+                    'Chrome did not grant microphone access, so Google Voice '
+                    'never placed the call. Grant the mic to voice.google.com '
+                    'in this profile, or pass '
+                    "extra_browser_args=['--use-fake-ui-for-media-stream']."
+                )
             if state != 'connected':
                 outcome = 'no-answer' if state == 'no-answer' else 'declined'
                 log.info('not connected (%s); hanging up', state)
@@ -380,7 +431,12 @@ class Caller:
     # call-state machine (read from the "Call panel" DOM)
     # ------------------------------------------------------------------ #
     async def _call_state(self) -> str:
-        """Classify the live call: 'idle' | 'ringing' | 'connected' | 'ended'."""
+        """Classify the live call.
+
+        One of 'idle', 'ringing', 'connected', 'ended', or 'mic-blocked' --
+        the last meaning Chrome never granted the microphone, so the call panel
+        is open but nothing was ever dialed.
+        """
         import json
 
         raw = await self._action('window.__gv.callPanel()')
@@ -391,6 +447,9 @@ class Caller:
         cls, txt = p.get('cls', ''), p.get('txt', '')
         if not p.get('present') or 'no-active-call' in cls:
             return 'idle'
+        # WebRTC needs the mic; without it the panel sits here forever.
+        if 'Allow mic access' in txt:
+            return 'mic-blocked'
         if 'Call ended' in txt:
             return 'ended'
         if 'Calling' in txt:
@@ -400,10 +459,15 @@ class Caller:
         return 'ringing'  # active panel, not yet connected -> treat as ringing
 
     async def _await_answer(self, ring_timeout: float) -> str:
-        """Wait through ringing. Returns 'connected', 'no-answer', or 'ended'."""
+        """Wait through ringing.
+
+        Returns 'connected', 'no-answer', 'ended', or 'mic-blocked'.
+        """
         seen_active = False
         for _ in range(int(max(1.0, ring_timeout) / 0.5)):
             state = await self._call_state()
+            if state == 'mic-blocked':
+                return state
             if state in ('ringing', 'connected'):
                 seen_active = True
             if state == 'connected':
