@@ -225,7 +225,9 @@ def _print_messages(messages, as_json: bool) -> None:
             if msg.start_time
             else '?'
         )
-        print(f'[{when}] {msg.phone_number}: {msg.text!r}')
+        # Calls, voicemails and recordings carry a length; SMS do not.
+        length = f' ({msg.duration}s)' if msg.duration else ''
+        print(f'[{when}] {msg.phone_number}{length}: {msg.text!r}')
 
 
 # --------------------------------------------------------------------------- #

@@ -93,13 +93,14 @@ Usage
     for msg in reversed(convo.messages):       # oldest first
         print(msg.start_time, msg.text)
 
-Voicemails (transcript in ``text``, audio via ``download``), call history, and
-full-text search are reads too:
+Voicemails (transcript in ``text``, length in ``duration``, audio via
+``download``), call history, and full-text search are reads too:
 
 .. code-block:: python
 
     for vm in voice.voicemails():
-        print(vm.start_time, vm.text)       # transcript
+        print(vm.start_time, vm.text)        # transcript, or '' if Google failed
+        print(vm.duration)                   # length in whole seconds
         vm.download('.')                     # save the .mp3
 
     voice.missed(); voice.placed(); voice.received()   # call records
