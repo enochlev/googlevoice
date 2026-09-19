@@ -53,8 +53,34 @@ class Message:
 
     @property
     def text(self) -> str | None:
-        """The SMS body, or voicemail transcript."""
-        return self._data.get('messageText')
+        """The SMS body, or the voicemail transcript.
+
+        Google only fills ``messageText`` for SMS. For a voicemail it is always
+        the empty string and the transcript arrives as ``transcript``, a list of
+        scored word tokens, so this joins those words back into a sentence.
+        Voicemails whose ``transcript_status`` is not ``'received'`` have no
+        transcript at all and keep the API's empty ``messageText``.
+        """
+        body = self._data.get('messageText')
+        return body or self.transcript or body
+
+    @property
+    def transcript(self) -> str | None:
+        """The voicemail transcript as a sentence, or None if there isn't one."""
+        tokens = (self._data.get('transcript') or {}).get('wordTokens') or []
+        words = [w.get('word') for w in tokens if w.get('word')]
+        return ' '.join(words) if words else None
+
+    @property
+    def transcript_status(self) -> str | None:
+        """``'received'`` when a transcript exists, e.g. ``'processingFailure'``
+        when Google could not transcribe the voicemail."""
+        return self._data.get('transcriptStatus')
+
+    @property
+    def transcript_confidence(self) -> float | None:
+        """Google's confidence in the whole transcript, 0..1."""
+        return (self._data.get('transcript') or {}).get('confidence')
 
     @property
     def type(self) -> str | None:
@@ -69,8 +95,16 @@ class Message:
 
     @property
     def duration(self) -> int | None:
-        """Call/voicemail duration in seconds, if any."""
-        return self._data.get('duration')
+        """How long the call or voicemail ran, **in whole seconds**.
+
+        Google reports this as an integer number of seconds (not milliseconds),
+        and only for calls, voicemails and recordings. SMS have no duration and
+        return None.
+        """
+        try:
+            return int(self._data['duration'])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @property
     def is_voicemail(self) -> bool:
@@ -129,6 +163,7 @@ class Message:
             'id': self.id,
             'text': self.text,
             'type': self.type,
+            'duration': self.duration,
             'incoming': self.incoming,
             'phone_number': self.phone_number,
             'did': self.did,

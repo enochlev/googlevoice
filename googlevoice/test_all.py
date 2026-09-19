@@ -74,7 +74,21 @@ VOICEMAIL_THREAD = {
                     'did': '+12085551234',
                     'contact': {'phoneNumber': '+12085559999'},
                     'type': 'voicemail',
-                    'messageText': 'hey call me back',
+                    'coarseType': 'callTypeVoicemail',
+                    # Google leaves messageText empty on every voicemail and
+                    # puts the transcript in scored word tokens instead.
+                    'messageText': '',
+                    'transcriptStatus': 'received',
+                    'transcript': {
+                        'confidence': 0.7193037,
+                        'wordTokens': [
+                            {'word': 'hey', 'confidence': 0.71},
+                            {'word': 'call', 'confidence': 0.72},
+                            {'word': 'me', 'confidence': 0.73},
+                            {'word': 'back', 'confidence': 0.74},
+                        ],
+                    },
+                    'duration': 10,
                     'recordingUrl': 'https://example.test/vm1.mp3',
                 },
                 {
@@ -277,11 +291,54 @@ class TestTypeFilters:
         vms = voice.voicemails()
         assert len(vms) == 1
         assert vms[0].is_voicemail
+        # messageText is empty on voicemails; the transcript words stand in.
         assert vms[0].text == 'hey call me back'
+        assert vms[0].transcript == 'hey call me back'
+        assert vms[0].transcript_status == 'received'
+        assert vms[0].transcript_confidence == pytest.approx(0.7193037)
+        assert vms[0].duration == 10  # seconds
+        assert vms[0].as_dict()['duration'] == 10
+        assert vms[0].as_dict()['text'] == 'hey call me back'
         assert vms[0].has_audio
         assert vms[0].recording_url == 'https://example.test/vm1.mp3'
         # voicemails come from the Voicemail folder
         assert json.loads(responses.calls[0].request.body)[0] == Folder.VOICEMAIL
+
+    def test_voicemail_without_transcript(self):
+        # transcriptStatus 'processingFailure': no transcript object at all.
+        vm = Message({
+            'id': 'vm9',
+            'type': 'voicemail',
+            'coarseType': 'callTypeVoicemail',
+            'messageText': '',
+            'transcriptStatus': 'processingFailure',
+            'duration': 2,
+            'recordingUrl': 'https://example.test/vm9.mp3',
+        })
+        assert vm.is_voicemail
+        assert vm.transcript is None
+        assert vm.text == ''  # the API's own empty body, not None
+        assert vm.transcript_status == 'processingFailure'
+        assert vm.transcript_confidence is None
+        assert vm.duration == 2
+        assert vm.as_dict()['duration'] == 2
+        assert vm.as_dict()['text'] == ''
+
+    def test_sms_text_and_duration(self):
+        # SMS keep messageText and have no duration.
+        sms = Message({'type': 'smsIn', 'messageText': 'hi there'})
+        assert sms.text == 'hi there'
+        assert sms.transcript is None
+        assert sms.duration is None
+        assert sms.as_dict()['duration'] is None
+
+    def test_call_duration_is_seconds(self):
+        call = Message({
+            'type': 'sip',
+            'coarseType': 'callTypeOutgoing',
+            'duration': 37,
+        })
+        assert call.duration == 37
 
     @responses.activate
     def test_missed(self, voice):
