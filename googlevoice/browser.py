@@ -25,6 +25,7 @@ Sending therefore needs Chrome installed and running; reading does not.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 
@@ -34,6 +35,7 @@ from .auth import (
     DEFAULT_PROFILE_DIR,
     DEFAULT_SESSION_PATH,
     ORIGIN,
+    REFRESH_TIMEOUT,
     browser_launch_args,
     close_browser,
     ensure_signed_in,
@@ -162,24 +164,32 @@ class BrowserSender:
         self._signed_in = True
 
     def close(self) -> None:
-        if self._browser is not None:
-            browser, self._browser, self._tab = self._browser, None, None
-            try:
-                self._loop.run_until_complete(self._shutdown(browser))
-            except Exception as err:  # noqa: BLE001 - teardown must not mask the real error
-                log.debug('graceful shutdown failed (%s); terminating', err)
-                with contextlib.suppress(Exception):
-                    browser.stop()
-        if self._lock is not None:
-            self._lock.release()
-            self._lock = None
+        try:
+            if self._browser is not None:
+                browser, self._browser, self._tab = self._browser, None, None
+                try:
+                    self._loop.run_until_complete(self._shutdown(browser))
+                except BaseException as err:
+                    log.debug('graceful shutdown failed (%s); terminating', err)
+                    with contextlib.suppress(Exception):
+                        browser.stop()
+                    if not isinstance(err, Exception):
+                        raise  # Ctrl-C and cancellation still propagate
+        finally:
+            # Whatever happened above, the profile must not stay locked.
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None
 
     async def _shutdown(self, browser) -> None:
         # Keep the portable session current with Google's rotated cookies, then
-        # let Chrome quit cleanly so the profile is written out.
+        # let Chrome quit cleanly so the profile is written out.  Both steps are
+        # bounded: a wedged Chrome or network must not hang close().
         if self._signed_in and self.session_path is not None:
             with contextlib.suppress(Exception):
-                await refresh_session(browser, self.session_path)
+                await asyncio.wait_for(
+                    refresh_session(browser, self.session_path), REFRESH_TIMEOUT
+                )
         await close_browser(browser)
 
     # ------------------------------------------------------------------ #

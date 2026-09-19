@@ -123,6 +123,25 @@ class TestAuth:
         path = tmp_path / 'session.json'
         save_session(FAKE_COOKIES, path)
         assert load_session(path) == FAKE_COOKIES
+        # written atomically (no temp file left behind) and owner-only
+        assert [p.name for p in tmp_path.iterdir()] == ['session.json']
+        if os.name == 'posix':
+            assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_save_session_keeps_the_old_file_if_the_write_fails(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / 'session.json'
+        save_session(FAKE_COOKIES, path)
+
+        def disk_full(*args, **kwargs):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(auth.os, 'replace', disk_full)
+        with pytest.raises(OSError):
+            save_session([], path)
+        assert load_session(path) == FAKE_COOKIES
+        assert [p.name for p in tmp_path.iterdir()] == ['session.json']
 
     def test_requests_session_preserves_cookie_domain(self):
         jar = Credentials(FAKE_COOKIES).requests_session().cookies
@@ -339,6 +358,10 @@ class TestTypeFilters:
             'duration': 37,
         })
         assert call.duration == 37
+        # numbers arrive as strings at times; anything unparseable is None
+        assert Message({'type': 'sip', 'duration': '12'}).duration == 12
+        assert Message({'type': 'sip', 'duration': 'n/a'}).duration is None
+        assert Message({'type': 'sip', 'duration': None}).duration is None
 
     @responses.activate
     def test_missed(self, voice):
@@ -616,8 +639,9 @@ class TestBrowserSession:
                 'path': '/',
                 'expires': None,
             },
-            # already expired -> skipped entirely
+            # already expired -> skipped entirely (0 is the epoch, not "session")
             {'name': 'OLD', 'value': 'o', 'domain': '.google.com', 'expires': now - 5},
+            {'name': 'EPOCH', 'value': 'e', 'domain': '.google.com', 'expires': 0},
         ]
         tab = FakeTab()
         assert _run(auth.inject_cookies(tab, cookies, ttl=1000)) == 3
@@ -629,7 +653,73 @@ class TestBrowserSession:
         assert by_name['NID']['sameSite'] == 'None'
         assert 'domain' not in by_name['__Host-GAPS']
         assert by_name['__Host-GAPS']['url'] == 'https://accounts.google.com/'
+        assert by_name['__Host-GAPS']['secure'] is True  # the prefix demands it
         assert float(by_name['__Host-GAPS']['expires']) > now
+
+    def test_inject_cookies_legacy_records_keep_http_only(self, nodriver):
+        # Files written before the harvester stored the flag: infer it for the
+        # known HttpOnly login cookies, leave the script-readable ones alone.
+        cookies = [
+            {'name': 'HSID', 'value': 'h', 'domain': '.google.com', 'expires': -1},
+            {'name': 'SAPISID', 'value': 'p', 'domain': '.google.com', 'expires': -1},
+            {
+                'name': 'SID',
+                'value': 's',
+                'domain': '.google.com',
+                'expires': -1,
+                'http_only': False,
+            },
+        ]
+        tab = FakeTab()
+        assert _run(auth.inject_cookies(tab, cookies)) == 3
+        by_name = {p['name']: p for p in tab.params('Network.setCookie')}
+        assert by_name['HSID']['httpOnly'] is True
+        assert by_name['SAPISID']['httpOnly'] is False
+        assert by_name['SID']['httpOnly'] is False
+
+    def test_inject_cookies_host_only_scheme_follows_secure_flag(self, nodriver):
+        cookies = [
+            {
+                'name': 'plain',
+                'value': 'x',
+                'domain': 'voice.google.com',
+                'path': '/u/',
+                'secure': False,
+                'expires': -1,
+            },
+            {
+                'name': 'COMPASS',
+                'value': 'c',
+                'domain': 'voice.google.com',
+                'secure': True,
+                'expires': -1,
+            },
+        ]
+        tab = FakeTab()
+        assert _run(auth.inject_cookies(tab, cookies)) == 2
+        by_name = {p['name']: p for p in tab.params('Network.setCookie')}
+        assert by_name['plain']['url'] == 'http://voice.google.com/u/'
+        assert by_name['plain']['secure'] is False
+        assert by_name['COMPASS']['url'] == 'https://voice.google.com/'
+
+    def test_inject_cookies_skips_malformed_records(self, nodriver):
+        cookies = [
+            {'value': 'no-name', 'domain': '.google.com'},
+            {'name': 'BAD', 'value': 'b', 'domain': '.google.com', 'expires': 'soon'},
+            {
+                'name': 'ODD',
+                'value': 'o',
+                'domain': '.google.com',
+                'same_site': 'unspecified',
+                'expires': -1,
+            },
+            {'name': 'OK', 'value': 'k', 'domain': '.google.com', 'expires': -1},
+        ]
+        tab = FakeTab()
+        assert _run(auth.inject_cookies(tab, cookies)) == 2
+        by_name = {p['name']: p for p in tab.params('Network.setCookie')}
+        assert set(by_name) == {'ODD', 'OK'}
+        assert 'sameSite' not in by_name['ODD']  # unknown value dropped, cookie kept
 
     def test_ensure_signed_in_uses_profile_when_already_signed_in(
         self, scripted_urls, tmp_path
@@ -649,6 +739,11 @@ class TestBrowserSession:
         assert tab.gets == [auth.ORIGIN]  # reloaded after injecting
         names = {p['name'] for p in tab.params('Network.setCookie')}
         assert names == {c['name'] for c in FAKE_COOKIES}
+
+    def test_ensure_signed_in_rejects_an_account_without_a_number(self, scripted_urls):
+        tab = FakeTab(['https://voice.google.com/u/0/signup'])
+        with pytest.raises(LoginError, match='no Google Voice number'):
+            _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=None))
 
     def test_ensure_signed_in_without_session_file(self, scripted_urls, tmp_path):
         tab = FakeTab([SIGNED_OUT_URL])
@@ -687,12 +782,46 @@ class TestBrowserSession:
 
     def test_refresh_session_requires_essential_cookies(self, tmp_path):
         path = tmp_path / 'session.json'
+        ok = lambda cookies: True
         partial = FakeBrowser([_browser_cookie('SID')])
-        assert _run(auth.refresh_session(partial, path)) is False
+        assert _run(auth.refresh_session(partial, path, validate=ok)) is False
+        assert not path.exists()
+        # a name whose value is empty does not count as present
+        hollow = FakeBrowser([
+            _browser_cookie(n, value='') for n in auth.ESSENTIAL_COOKIES
+        ])
+        assert _run(auth.refresh_session(hollow, path, validate=ok)) is False
         assert not path.exists()
         full = FakeBrowser([_browser_cookie(n) for n in auth.ESSENTIAL_COOKIES])
-        assert _run(auth.refresh_session(full, path)) is True
+        assert _run(auth.refresh_session(full, path, validate=ok)) is True
         assert {c['name'] for c in load_session(path)} == auth.ESSENTIAL_COOKIES
+
+    def test_refresh_session_keeps_the_file_when_cookies_do_not_authenticate(
+        self, tmp_path
+    ):
+        path = tmp_path / 'session.json'
+        save_session(FAKE_COOKIES, path)
+        probed = []
+        browser = FakeBrowser([_browser_cookie(n) for n in auth.ESSENTIAL_COOKIES])
+
+        def validate(cookies):
+            probed.append({c['name'] for c in cookies})
+            return False
+
+        assert _run(auth.refresh_session(browser, path, validate=validate)) is False
+        assert probed == [auth.ESSENTIAL_COOKIES]
+        assert load_session(path) == FAKE_COOKIES  # untouched
+
+    def test_refresh_session_probes_account_get_by_default(self, tmp_path, monkeypatch):
+        probes = []
+        monkeypatch.setattr(
+            auth,
+            'session_is_valid',
+            lambda cookies: probes.append(len(cookies)) or True,
+        )
+        browser = FakeBrowser([_browser_cookie(n) for n in auth.ESSENTIAL_COOKIES])
+        assert _run(auth.refresh_session(browser, tmp_path / 's.json')) is True
+        assert probes == [len(auth.ESSENTIAL_COOKIES)]
 
     def test_close_browser_prefers_graceful_close(self, nodriver):
         browser = FakeBrowser()
@@ -706,9 +835,44 @@ class TestBrowserSession:
         _run(auth.close_browser(browser))
         assert browser.stopped
 
-    def test_sender_close_refreshes_session_then_quits(self, nodriver, tmp_path):
+    def test_close_browser_bounds_a_hung_cdp_close(self, nodriver):
+        browser = FakeBrowser()
+
+        async def hang(cmd):
+            next(cmd)
+            await asyncio.sleep(3600)
+
+        browser.send = hang
+        _run(auth.close_browser(browser, timeout=0.05))
+        assert browser.stopped
+
+    def test_close_browser_kills_a_chrome_that_ignores_sigterm(self, nodriver):
+        class Stubborn:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+                self._dead = asyncio.Event()
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+                self._dead.set()
+
+            async def wait(self):
+                await self._dead.wait()
+                return self.returncode
+
+        browser = FakeBrowser(close_ok=False)
+        browser._process = process = Stubborn()
+        _run(auth.close_browser(browser, timeout=0.05))
+        assert browser.stopped and process.killed
+
+    def test_sender_close_refreshes_session_then_quits(
+        self, nodriver, tmp_path, monkeypatch
+    ):
         from googlevoice.browser import BrowserSender
 
+        monkeypatch.setattr(auth, 'session_is_valid', lambda cookies: True)
         path = tmp_path / 'session.json'
         sender = BrowserSender(tmp_path / 'profile', session_path=path)
         sender._loop = asyncio.new_event_loop()
@@ -722,6 +886,26 @@ class TestBrowserSession:
         assert sender._browser is None and sender._tab is None
         assert path.exists()  # rotated cookies saved for next time
         assert browser.sent[0]['method'] == 'Browser.close'
+        sender._loop.close()
+
+    def test_sender_close_releases_the_lock_on_interrupt(self, tmp_path):
+        from googlevoice.browser import BrowserSender
+
+        sender = BrowserSender(tmp_path / 'profile', session_path=None)
+        sender._loop = asyncio.new_event_loop()
+        sender._browser = browser = FakeBrowser()
+        released = []
+        sender._lock = types.SimpleNamespace(release=lambda: released.append(True))
+
+        async def interrupted(browser):
+            raise KeyboardInterrupt
+
+        sender._shutdown = interrupted
+        with pytest.raises(KeyboardInterrupt):
+            sender.close()
+        assert released == [True]
+        assert browser.stopped
+        assert sender._browser is None and sender._lock is None
         sender._loop.close()
 
 

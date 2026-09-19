@@ -37,6 +37,7 @@ import logging
 import os
 import pathlib
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -127,14 +128,27 @@ def _is_google_cookie(domain: str) -> bool:
 def save_session(
     cookies: list[dict], path: pathlib.Path = DEFAULT_SESSION_PATH
 ) -> pathlib.Path:
-    """Write harvested cookies to ``path`` as portable JSON (mode 0600)."""
+    """
+    Write harvested cookies to ``path`` as portable JSON (mode 0600).
+
+    The file is created owner-only from its first byte and swapped into place
+    atomically, so a crash mid-write can neither truncate the previous session
+    nor leave the credentials world-readable for an instant.
+    """
     path = pathlib.Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({'version': 1, 'cookies': cookies}, indent=2), encoding='utf-8'
-    )
-    with contextlib.suppress(OSError):
-        path.chmod(0o600)  # credentials -- keep them to ourselves
+    payload = json.dumps({'version': 1, 'cookies': cookies}, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f'{path.name}.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     return path
 
 
@@ -254,6 +268,36 @@ def session_is_valid(cookies: list[dict]) -> bool:
 # cookie's lifetime at 400 days; a year keeps them well inside that.
 SESSION_COOKIE_TTL = 365 * 86400
 
+# Upper bound on refreshing session.json at shutdown (cookie harvest plus the
+# ``account/get`` probe), so a wedged browser or network cannot hang close().
+REFRESH_TIMEOUT = 30.0
+
+# Google login cookies Chrome reports as HttpOnly (observed live).  Consulted
+# only for records written before the harvester stored ``http_only``, so a
+# restored legacy session does not expose them to page scripts.  Deliberately
+# absent: SID, SAPISID, APISID, SIDCC and the ``__Secure-*PAPISID`` pair, which
+# the web app reads from JavaScript.
+_LEGACY_HTTP_ONLY = frozenset({
+    'HSID',
+    'SSID',
+    'LSID',
+    'NID',
+    'S',
+    'COMPASS',
+    '__Secure-1PSID',
+    '__Secure-3PSID',
+    '__Secure-1PSIDTS',
+    '__Secure-3PSIDTS',
+    '__Secure-1PSIDRTS',
+    '__Secure-3PSIDRTS',
+    '__Secure-1PSIDCC',
+    '__Secure-3PSIDCC',
+    '__Host-1PLSID',
+    '__Host-3PLSID',
+    '__Host-GAPS',
+    '__Host-GAPSTS',
+})
+
 
 def is_signed_in_url(url: str | None) -> bool:
     """
@@ -264,6 +308,19 @@ def is_signed_in_url(url: str | None) -> bool:
     """
     parts = urllib.parse.urlsplit(url or '')
     return parts.hostname == 'voice.google.com' and not parts.path.startswith('/about')
+
+
+def needs_voice_number(url: str | None) -> bool:
+    """True if ``url`` is Voice's number-signup flow: signed in, but no number yet."""
+    return urllib.parse.urlsplit(url or '').path.rstrip('/').endswith('/signup')
+
+
+def _check_has_number(url: str) -> None:
+    if needs_voice_number(url):
+        raise LoginError(
+            'Signed in, but this Google account has no Google Voice number '
+            f'(the browser landed on {url}). Pick a number at voice.google.com first.'
+        )
 
 
 async def harvest_cookies(browser) -> list[dict]:
@@ -287,6 +344,48 @@ async def harvest_cookies(browser) -> list[dict]:
     return cookies
 
 
+def _cookie_params(c: dict, *, now: float, ttl: float) -> dict | None:
+    """``Network.setCookie`` arguments for one saved cookie; None once expired."""
+    from nodriver import cdp
+
+    expires = c.get('expires')
+    if expires is None or expires < 0:
+        expires = now + ttl  # the browser had it as session-only: pin it
+    elif expires < now:
+        return None  # 0 is the epoch, not "session": expired like any past time
+    name = c['name']
+    path = c.get('path') or '/'
+    http_only = c.get('http_only')
+    if http_only is None:  # legacy record: the flag was never saved
+        http_only = name in _LEGACY_HTTP_ONLY
+    # Prefixed names are Secure by definition; Chrome rejects them otherwise.
+    secure = bool(c.get('secure', False)) or name.startswith(('__Host-', '__Secure-'))
+    kwargs = {
+        'name': name,
+        'value': c['value'],
+        'path': path,
+        'secure': secure,
+        'http_only': bool(http_only),
+        'expires': cdp.network.TimeSinceEpoch(expires),
+    }
+    same_site = c.get('same_site')
+    if same_site:
+        # An unknown SameSite value drops the attribute, not the cookie.
+        with contextlib.suppress(ValueError):
+            kwargs['same_site'] = cdp.network.CookieSameSite(same_site)
+    domain = c['domain']
+    if domain.startswith('.'):
+        kwargs['domain'] = domain
+    else:
+        # A host-only cookie (e.g. ``__Host-…`` on accounts.google.com) must
+        # carry no Domain attribute, so set it through its URL instead.  Chrome
+        # marks a cookie set through an https URL Secure, so the scheme has to
+        # follow the saved flag.
+        scheme = 'https' if secure else 'http'
+        kwargs['url'] = f'{scheme}://{domain}{path}'
+    return kwargs
+
+
 async def inject_cookies(
     tab, cookies: list[dict], *, ttl: float = SESSION_COOKIE_TTL
 ) -> int:
@@ -295,40 +394,22 @@ async def inject_cookies(
 
     Cookies the browser had reported as session-only get an expiry ``ttl``
     seconds out, so they persist across a clean Chrome exit.  Already-expired
-    cookies are skipped.  A single rejected cookie never aborts the rest.
+    cookies are skipped.  A malformed or rejected cookie never aborts the rest.
     """
     from nodriver import cdp
 
     now = time.time()
     count = 0
     for c in cookies:
-        expires = c.get('expires')
-        if expires is not None and 0 < expires < now:
-            continue
-        if not expires or expires < 0:
-            expires = now + ttl
-        path = c.get('path') or '/'
-        kwargs = {
-            'name': c['name'],
-            'value': c['value'],
-            'path': path,
-            'secure': bool(c.get('secure', False)),
-            'http_only': bool(c.get('http_only', False)),
-            'expires': cdp.network.TimeSinceEpoch(expires),
-        }
-        if c.get('same_site'):
-            kwargs['same_site'] = cdp.network.CookieSameSite(c['same_site'])
-        domain = c['domain']
-        if domain.startswith('.'):
-            kwargs['domain'] = domain
-        else:
-            # A host-only cookie (e.g. ``__Host-…`` on accounts.google.com) must
-            # carry no Domain attribute, so set it through its URL instead.
-            kwargs['url'] = f'https://{domain}{path}'
         try:
+            kwargs = _cookie_params(c, now=now, ttl=ttl)
+            if kwargs is None:
+                continue
             ok = await tab.send(cdp.network.set_cookie(**kwargs))
         except Exception as err:  # noqa: BLE001 - one bad cookie must not sink the rest
-            log.debug('set_cookie %s failed: %s', c['name'], err)
+            # Log the type only: an error message could echo the cookie's value.
+            name = c.get('name') if isinstance(c, dict) else None
+            log.debug('set_cookie %s failed (%s)', name, type(err).__name__)
             continue
         count += bool(ok)
     return count
@@ -377,6 +458,7 @@ async def ensure_signed_in(
     """
     landed = await settled_url(tab)
     if is_signed_in_url(landed):
+        _check_has_number(landed)
         return landed
     hint = 'Run `python -m googlevoice login` to sign in again.'
     if session_path is None:
@@ -397,45 +479,77 @@ async def ensure_signed_in(
             'Not signed in to Google Voice: the browser profile is signed out '
             f'and the saved session at {session_path} no longer works. {hint}'
         )
+    _check_has_number(landed)
     return landed
 
 
 async def refresh_session(
-    browser, session_path: pathlib.Path = DEFAULT_SESSION_PATH
+    browser,
+    session_path: pathlib.Path = DEFAULT_SESSION_PATH,
+    *,
+    validate=None,
 ) -> bool:
     """
     Overwrite ``session_path`` with the browser's current Google cookies.
 
     Google rotates some login cookies while the web app runs; saving them keeps
-    the portable session fresh.  Skipped (returns False) unless the essential
-    login cookies are present.
+    the portable session fresh.  The file is only replaced by a set that carries
+    the essential login cookies *with values* and that authenticates a live
+    ``account/get`` (``validate``, by default :func:`session_is_valid`).
+    Anything less returns False and leaves the saved session alone.
     """
+    if validate is None:
+        validate = session_is_valid
     cookies = await harvest_cookies(browser)
-    if not ESSENTIAL_COOKIES <= {c['name'] for c in cookies}:
+    present = {c['name'] for c in cookies if c['value']}
+    if not ESSENTIAL_COOKIES <= present:
+        return False
+    if not await asyncio.to_thread(validate, cookies):
+        log.info("the browser's cookies do not authenticate; keeping the saved session")
         return False
     save_session(cookies, session_path)
     return True
 
 
+async def _reap(process, timeout: float) -> None:
+    """Wait for Chrome to exit after SIGTERM; SIGKILL it if it will not."""
+    try:
+        await asyncio.wait_for(process.wait(), timeout)
+    except Exception:  # noqa: BLE001 - still running: escalate
+        with contextlib.suppress(Exception):
+            process.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout)
+
+
 async def close_browser(browser, *, timeout: float = 10.0) -> None:
     """
-    Quit Chrome cleanly and wait for it to exit; fall back to killing it.
+    Quit Chrome cleanly and wait for it to exit; escalate if it will not.
 
-    ``nodriver``'s ``stop()`` only sends SIGTERM, which on some platforms leaves
-    the profile marked as crashed and its cookie store unflushed.  Asking Chrome
-    to close over CDP lets it write the profile out first.
+    ``nodriver``'s ``stop()`` only sends SIGTERM and returns at once, which on
+    some platforms leaves the profile marked as crashed and its cookie store
+    unflushed.  Asking Chrome to close over CDP lets it write the profile out
+    first.  Every step is bounded by ``timeout``, so a wedged Chrome can neither
+    hang the caller nor outlive the profile lock: after a failed graceful close
+    it is terminated, then killed, and waited for.
     """
     from nodriver import cdp
 
     process = getattr(browser, '_process', None)
-    try:
+
+    async def graceful() -> None:
         await browser.send(cdp.browser.close())
         if process is not None:
-            await asyncio.wait_for(process.wait(), timeout)
+            await process.wait()
+
+    try:
+        await asyncio.wait_for(graceful(), timeout)
     except Exception as err:  # noqa: BLE001 - teardown must never mask the real error
         log.debug('graceful browser close failed (%s); terminating instead', err)
         with contextlib.suppress(Exception):
             browser.stop()
+        if process is not None:
+            await _reap(process, timeout)
         return
     with contextlib.suppress(Exception):
         await browser.aclose()
