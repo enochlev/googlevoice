@@ -29,14 +29,20 @@ the one-time :func:`browser_login`.  Everything after that is pure ``requests``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
 import logging
+import os
 import pathlib
+import sys
 import time
+import urllib.parse
 
 import requests
+
+from .util import LoginError
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +77,39 @@ DEFAULT_PROFILE_DIR = DEFAULT_DIR / 'chrome-profile'
 
 # Cookies that signal a usable Google login (used to detect login completion).
 ESSENTIAL_COOKIES = {'SID', 'SAPISID', '__Secure-3PSID'}
+
+
+# --------------------------------------------------------------------------- #
+# Browser launch helpers (shared by browser-driven features)
+# --------------------------------------------------------------------------- #
+def headless_default() -> bool:
+    """
+    Whether to run Chrome headless by default.
+
+    On Linux a *headed* Chrome cannot start without a display server, so if
+    neither ``DISPLAY`` nor ``WAYLAND_DISPLAY`` is set (a headless server,
+    container, CI, or a tool that spawns us without a display) we must go
+    headless. On macOS/Windows headed always works, so default to headed.
+    """
+    if sys.platform.startswith('linux'):
+        return not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+    return False
+
+
+def browser_launch_args(*, no_sandbox: bool | None = None) -> list[str]:
+    """
+    Common ``browser_args`` for ``nodriver``/Chrome.
+
+    ``--no-sandbox`` is added only when running as root (``no_sandbox=None``),
+    since Chrome's sandbox can't initialize as root/in many containers and
+    refuses to launch; on a normal user account it stays on (safer).
+    """
+    args = ['--no-first-run', '--no-default-browser-check']
+    if no_sandbox is None:
+        no_sandbox = os.name == 'posix' and getattr(os, 'geteuid', lambda: 1)() == 0
+    if no_sandbox:
+        args.append('--no-sandbox')
+    return args
 
 
 class AuthError(Exception):
@@ -199,13 +238,217 @@ def session_is_valid(cookies: list[dict]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Browser session helpers (shared by login, BrowserSender and Caller)
+#
+# The Chrome profile is NOT a reliable login store.  Chrome discards
+# session-only cookies on every clean exit, and Google's login cookies end up
+# session-only in the profile, so a profile that sent a text yesterday is
+# signed out today ("sending a text makes me log in again").  The portable
+# ``session.json`` is the real credential: every browser-driven feature checks
+# the page it landed on and, if the profile is signed out, injects the saved
+# cookies (pinned with an expiry so they survive the next clean exit) and
+# reloads.  On close the saved session is refreshed with Google's rotated
+# cookies and Chrome is asked to quit cleanly so the profile is flushed.
+# --------------------------------------------------------------------------- #
+# Expiry given to cookies the browser reported as session-only.  Chrome caps a
+# cookie's lifetime at 400 days; a year keeps them well inside that.
+SESSION_COOKIE_TTL = 365 * 86400
+
+
+def is_signed_in_url(url: str | None) -> bool:
+    """
+    True if ``url`` is inside the signed-in Voice web app.
+
+    Signed out, ``voice.google.com`` bounces to ``accounts.google.com``, to its
+    own ``/about`` marketing page, or to ``workspace.google.com``.
+    """
+    parts = urllib.parse.urlsplit(url or '')
+    return parts.hostname == 'voice.google.com' and not parts.path.startswith('/about')
+
+
+async def harvest_cookies(browser) -> list[dict]:
+    """The Google cookies currently in ``browser`` as portable dicts."""
+    cookies = []
+    for c in await browser.cookies.get_all():
+        if not _is_google_cookie(c.domain):
+            continue
+        same_site = getattr(c, 'same_site', None)
+        cookies.append({
+            'name': c.name,
+            'value': c.value,
+            'domain': c.domain,
+            'path': c.path or '/',
+            'secure': bool(getattr(c, 'secure', False)),
+            'http_only': bool(getattr(c, 'http_only', False)),
+            'same_site': same_site.value if same_site else None,
+            # -1 (or None) means a session cookie
+            'expires': getattr(c, 'expires', None),
+        })
+    return cookies
+
+
+async def inject_cookies(
+    tab, cookies: list[dict], *, ttl: float = SESSION_COOKIE_TTL
+) -> int:
+    """
+    Set saved ``cookies`` in the browser via CDP; return how many took.
+
+    Cookies the browser had reported as session-only get an expiry ``ttl``
+    seconds out, so they persist across a clean Chrome exit.  Already-expired
+    cookies are skipped.  A single rejected cookie never aborts the rest.
+    """
+    from nodriver import cdp
+
+    now = time.time()
+    count = 0
+    for c in cookies:
+        expires = c.get('expires')
+        if expires is not None and 0 < expires < now:
+            continue
+        if not expires or expires < 0:
+            expires = now + ttl
+        path = c.get('path') or '/'
+        kwargs = {
+            'name': c['name'],
+            'value': c['value'],
+            'path': path,
+            'secure': bool(c.get('secure', False)),
+            'http_only': bool(c.get('http_only', False)),
+            'expires': cdp.network.TimeSinceEpoch(expires),
+        }
+        if c.get('same_site'):
+            kwargs['same_site'] = cdp.network.CookieSameSite(c['same_site'])
+        domain = c['domain']
+        if domain.startswith('.'):
+            kwargs['domain'] = domain
+        else:
+            # A host-only cookie (e.g. ``__Host-…`` on accounts.google.com) must
+            # carry no Domain attribute, so set it through its URL instead.
+            kwargs['url'] = f'https://{domain}{path}'
+        try:
+            ok = await tab.send(cdp.network.set_cookie(**kwargs))
+        except Exception as err:  # noqa: BLE001 - one bad cookie must not sink the rest
+            log.debug('set_cookie %s failed: %s', c['name'], err)
+            continue
+        count += bool(ok)
+    return count
+
+
+async def settled_url(tab, *, timeout: float = 20.0, poll: float = 1.0) -> str:
+    """
+    The tab's URL once the document has loaded and stopped redirecting.
+
+    Signed-out visits hop through two or three redirects, so a single early
+    ``location.href`` read would report ``voice.google.com`` and be wrong.
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while True:
+        try:
+            state = await tab.evaluate(
+                "document.readyState + ' ' + location.href", await_promise=False
+            )
+        except Exception as err:  # noqa: BLE001 - navigating away destroys the context
+            log.debug('page not readable yet: %s', err)
+            state = None
+        ready, _, url = (state or '').partition(' ')
+        if ready == 'complete' and url and url == last:
+            return url
+        last = url if ready == 'complete' else None
+        if time.monotonic() >= deadline:
+            return last or url or ''
+        await asyncio.sleep(poll)
+
+
+async def ensure_signed_in(
+    browser,
+    tab,
+    *,
+    session_path: pathlib.Path | None = DEFAULT_SESSION_PATH,
+    url: str = ORIGIN,
+) -> str:
+    """
+    Make sure ``tab`` is inside the signed-in Voice web app; return its URL.
+
+    If the profile is signed out, inject the cookies saved at ``session_path``
+    and reload ``url``.  Raises :class:`~googlevoice.util.LoginError` when
+    neither the profile nor the saved session works (``session_path=None``
+    skips the injection).
+    """
+    landed = await settled_url(tab)
+    if is_signed_in_url(landed):
+        return landed
+    hint = 'Run `python -m googlevoice login` to sign in again.'
+    if session_path is None:
+        raise LoginError(f'Browser profile is not signed in to Google Voice. {hint}')
+    try:
+        cookies = load_session(session_path)
+    except AuthError as err:
+        raise LoginError(
+            'Not signed in to Google Voice: the browser profile is signed out '
+            f'and the saved session could not be loaded ({err}). {hint}'
+        ) from None
+    count = await inject_cookies(tab, cookies)
+    log.info('profile signed out; injected %d saved cookies', count)
+    await tab.get(url)
+    landed = await settled_url(tab)
+    if not is_signed_in_url(landed):
+        raise LoginError(
+            'Not signed in to Google Voice: the browser profile is signed out '
+            f'and the saved session at {session_path} no longer works. {hint}'
+        )
+    return landed
+
+
+async def refresh_session(
+    browser, session_path: pathlib.Path = DEFAULT_SESSION_PATH
+) -> bool:
+    """
+    Overwrite ``session_path`` with the browser's current Google cookies.
+
+    Google rotates some login cookies while the web app runs; saving them keeps
+    the portable session fresh.  Skipped (returns False) unless the essential
+    login cookies are present.
+    """
+    cookies = await harvest_cookies(browser)
+    if not ESSENTIAL_COOKIES <= {c['name'] for c in cookies}:
+        return False
+    save_session(cookies, session_path)
+    return True
+
+
+async def close_browser(browser, *, timeout: float = 10.0) -> None:
+    """
+    Quit Chrome cleanly and wait for it to exit; fall back to killing it.
+
+    ``nodriver``'s ``stop()`` only sends SIGTERM, which on some platforms leaves
+    the profile marked as crashed and its cookie store unflushed.  Asking Chrome
+    to close over CDP lets it write the profile out first.
+    """
+    from nodriver import cdp
+
+    process = getattr(browser, '_process', None)
+    try:
+        await browser.send(cdp.browser.close())
+        if process is not None:
+            await asyncio.wait_for(process.wait(), timeout)
+    except Exception as err:  # noqa: BLE001 - teardown must never mask the real error
+        log.debug('graceful browser close failed (%s); terminating instead', err)
+        with contextlib.suppress(Exception):
+            browser.stop()
+        return
+    with contextlib.suppress(Exception):
+        await browser.aclose()
+    browser._process = None
+    browser._process_pid = None
+
+
+# --------------------------------------------------------------------------- #
 # Browser login (one-time, needs Chrome)
 # --------------------------------------------------------------------------- #
 async def _browser_login_async(
     profile_dir: pathlib.Path, *, headless: bool, timeout: float, poll: float
 ):
-    import asyncio
-
     import nodriver as uc
 
     profile_dir = pathlib.Path(profile_dir).expanduser()
@@ -214,37 +457,28 @@ async def _browser_login_async(
     browser = await uc.start(
         headless=headless,
         user_data_dir=str(profile_dir),
-        browser_args=['--no-first-run', '--no-default-browser-check'],
+        browser_args=browser_launch_args(),
     )
     try:
-        await browser.get(ORIGIN)
+        tab = await browser.get(ORIGIN)
         print('>>> A Chrome window opened. Sign in to the Google account that')
         print('>>> owns your Google Voice number, then wait on the Voice inbox.')
         print('>>> Detecting login automatically...')
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            cookies = [
-                {
-                    'name': c.name,
-                    'value': c.value,
-                    'domain': c.domain,
-                    'path': c.path or '/',
-                    'secure': bool(getattr(c, 'secure', False)),
-                    'expires': getattr(c, 'expires', None),
-                }
-                for c in await browser.cookies.get_all()
-                if _is_google_cookie(c.domain)
-            ]
+            cookies = await harvest_cookies(browser)
             names = {c['name'] for c in cookies}
             # Confirm by actually authenticating, not just by cookie presence.
             if ESSENTIAL_COOKIES <= names and session_is_valid(cookies):
                 print('>>> Login confirmed (account/get succeeded).')
+                # Pin the login in the profile too, so it outlives a clean exit.
+                await inject_cookies(tab, cookies)
                 return cookies
             await asyncio.sleep(poll)
         raise AuthError(f'Timed out after {timeout:.0f}s waiting for login.')
     finally:
-        browser.stop()
+        await close_browser(browser)
 
 
 def browser_login(

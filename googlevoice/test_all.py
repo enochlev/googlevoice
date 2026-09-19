@@ -1,16 +1,19 @@
+import asyncio
 import json
 import os
 import re
+import time
+import types
 
 import pytest
 import responses
 
-from googlevoice import Credentials, Voice
+from googlevoice import Credentials, Voice, auth
 from googlevoice import _browserlock as bl
 from googlevoice.__main__ import main
 from googlevoice.auth import API_BASE, load_session, sapisid_hash, save_session
-from googlevoice.util import Message, Thread
-from googlevoice.voice import _thread_id_for, normalize_number
+from googlevoice.util import LoginError, Message, Thread
+from googlevoice.voice import Folder, _thread_id_for, normalize_number
 
 FAKE_COOKIES = [
     {'name': 'SAPISID', 'value': 'sapisid-val', 'domain': '.google.com', 'path': '/'},
@@ -44,6 +47,9 @@ THREADS_RESPONSE = {
                     'did': '+12085551234',
                     'contact': {'phoneNumber': '+12085550000', 'name': 'Pat'},
                     'type': 'smsIn',
+                    # real SMS also carry a coarseType -- incoming must not be
+                    # fooled by it (it is never 'callTypeIncoming' for SMS).
+                    'coarseType': 'callTypeSmsIn',
                     'messageText': 'hello there',
                 }
             ],
@@ -52,9 +58,42 @@ THREADS_RESPONSE = {
 }
 
 
+# A thread holding a voicemail (with audio + transcript) and a missed call --
+# exercises the type filters and download.
+VOICEMAIL_THREAD = {
+    'thread': [
+        {
+            'id': 't.+12085559999',
+            'read': True,
+            'isText': False,
+            'headingContactsPhoneNumberKey': ['+12085559999'],
+            'item': [
+                {
+                    'id': 'vm1',
+                    'startTime': '1781375718535',
+                    'did': '+12085551234',
+                    'contact': {'phoneNumber': '+12085559999'},
+                    'type': 'voicemail',
+                    'messageText': 'hey call me back',
+                    'recordingUrl': 'https://example.test/vm1.mp3',
+                },
+                {
+                    'id': 'm1',
+                    'startTime': '1781375710000',
+                    'contact': {'phoneNumber': '+12085559999'},
+                    'type': 'missed',
+                    'coarseType': 'callTypeMissed',
+                },
+            ],
+        }
+    ]
+}
+
+
 @pytest.fixture
 def voice():
-    return Voice(credentials=Credentials(FAKE_COOKIES))
+    # auto_login off so a mocked 401 doesn't try to launch a real browser
+    return Voice(credentials=Credentials(FAKE_COOKIES), auto_login=False)
 
 
 class TestAuth:
@@ -98,11 +137,18 @@ class TestVoiceReads:
 
     @responses.activate
     def test_thread_by_number(self, voice):
-        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
+        single = {'thread': THREADS_RESPONSE['thread'][0]}
+        responses.post(API_BASE + 'api2thread/get', json=single)
         found = voice.thread('+12085550000')
         assert found is not None
         assert found.id == 't.+12085550000'
-        assert voice.thread('+19998887777') is None  # not in the list
+        # request asks for the normalized thread id
+        assert json.loads(responses.calls[-1].request.body)[0] == 't.+12085550000'
+
+    @responses.activate
+    def test_thread_not_found(self, voice):
+        responses.post(API_BASE + 'api2thread/get', json={})  # no 'thread'
+        assert voice.thread('+19998887777') is None
 
     @responses.activate
     def test_threads_messages_param(self, voice):
@@ -113,9 +159,10 @@ class TestVoiceReads:
 
     @responses.activate
     def test_thread_accepts_formatted_number(self, voice):
-        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
-        # thread id in the fixture is t.+12085550000
+        responses.post(API_BASE + 'api2thread/get', json={'thread': {'id': 't.x'}})
         assert voice.thread('(208) 555-0000') is not None
+        # formatted number is normalized before becoming the thread id
+        assert json.loads(responses.calls[-1].request.body)[0] == 't.+12085550000'
 
     @responses.activate
     def test_login_error_on_401(self, voice):
@@ -124,6 +171,25 @@ class TestVoiceReads:
         responses.post(API_BASE + 'account/get', status=401, body='nope')
         with pytest.raises(LoginError):
             voice.account()
+
+    @responses.activate
+    def test_auto_login_refreshes_and_retries(self, monkeypatch):
+        import googlevoice.voice as voicemod
+
+        # First account/get 401s, then (after a "refresh") succeeds.
+        responses.post(API_BASE + 'account/get', status=401, body='nope')
+        responses.post(API_BASE + 'account/get', json=ACCOUNT_RESPONSE)
+
+        calls = []
+
+        def fake_login(*a, **k):
+            calls.append(1)
+            return Credentials(FAKE_COOKIES)
+
+        monkeypatch.setattr(voicemod.auth, 'browser_login', fake_login)
+        v = Voice(credentials=Credentials(FAKE_COOKIES), auto_login=True)
+        assert v.number == '+12085551234'
+        assert calls == [1]  # refreshed exactly once
 
 
 class TestSend:
@@ -143,6 +209,7 @@ class TestSend:
         assert _thread_id_for('(208) 555-0000') == 't.+12085550000'  # normalized
         assert _thread_id_for('t.+12085550000') == 't.+12085550000'
         assert _thread_id_for('g.Group Message.x') == 'g.Group Message.x'
+        assert _thread_id_for('c.PCIFABCDEF') == 'c.PCIFABCDEF'  # call id passthrough
 
 
 class TestNumbers:
@@ -165,6 +232,17 @@ class TestMessage:
         assert msg.phone_number == '+12085550000'
         assert msg.start_time is not None
 
+    def test_incoming_direction(self):
+        # SMS: type is authoritative even though a (non-Incoming) coarseType
+        # is present -- the bug this guards against.
+        assert Message({'type': 'smsIn', 'coarseType': 'callTypeSmsIn'}).incoming
+        assert not Message({'type': 'smsOut', 'coarseType': 'callTypeSmsOut'}).incoming
+        # calls/voicemail: direction from coarseType
+        assert not Message({'type': 'sip', 'coarseType': 'callTypeOutgoing'}).incoming
+        assert Message({'type': 'sip', 'coarseType': 'callTypeIncoming'}).incoming
+        assert Message({'type': 'missed', 'coarseType': 'callTypeMissed'}).incoming
+        assert Message({'type': 'voicemail', 'recordingUrl': 'x'}).incoming
+
     def test_as_dict(self):
         thread = Thread(None, THREADS_RESPONSE['thread'][0])
         d = thread.as_dict()
@@ -178,14 +256,126 @@ class TestMessage:
         assert msg['start_time'].endswith('+00:00')
 
 
+class TestFolders:
+    @responses.activate
+    def test_folder_selectors(self, voice):
+        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
+        for call, expected in [
+            (voice.calls, Folder.CALLS),
+            (voice.inbox, Folder.INBOX),
+            (voice.spam, Folder.SPAM),
+            (voice.archived, Folder.ARCHIVE),
+        ]:
+            call()
+            assert json.loads(responses.calls[-1].request.body)[0] == expected
+
+
+class TestTypeFilters:
+    @responses.activate
+    def test_voicemails(self, voice):
+        responses.post(API_BASE + 'api2thread/list', json=VOICEMAIL_THREAD)
+        vms = voice.voicemails()
+        assert len(vms) == 1
+        assert vms[0].is_voicemail
+        assert vms[0].text == 'hey call me back'
+        assert vms[0].has_audio
+        assert vms[0].recording_url == 'https://example.test/vm1.mp3'
+        # voicemails come from the Voicemail folder
+        assert json.loads(responses.calls[0].request.body)[0] == Folder.VOICEMAIL
+
+    @responses.activate
+    def test_missed(self, voice):
+        responses.post(API_BASE + 'api2thread/list', json=VOICEMAIL_THREAD)
+        missed = voice.missed()
+        assert len(missed) == 1
+        assert missed[0].type == 'missed'
+        assert json.loads(responses.calls[0].request.body)[0] == Folder.CALLS
+
+
+class TestThreadActions:
+    """thread/batchupdateattributes -- body [[[values, mask, 1]]]."""
+
+    @responses.activate
+    def test_archive_sets_index_5(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        voice.archive('+12085550000')
+        body = json.loads(responses.calls[-1].request.body)
+        values, mask, tail = body[0][0]
+        assert values == ['t.+12085550000', None, None, None, None, 1]
+        assert mask == [None, None, None, None, None, 1]
+        assert tail == 1
+
+    @responses.activate
+    def test_unarchive_sets_index_5_to_zero(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        voice.unarchive('+12085550000')
+        values = json.loads(responses.calls[-1].request.body)[0][0][0]
+        assert values == ['t.+12085550000', None, None, None, None, 0]
+
+    @responses.activate
+    def test_spam_block_read_indices(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        for action, index in [
+            (voice.mark_spam, 2),
+            (voice.block, 1),
+            (voice.mark_read, 3),
+        ]:
+            action('+12085550000')
+            values = json.loads(responses.calls[-1].request.body)[0][0][0]
+            assert values[index] == 1 and len(values) == index + 1
+
+    @responses.activate
+    def test_thread_shortcut_calls_voice(self, voice):
+        responses.post(API_BASE + 'thread/batchupdateattributes', json={})
+        thread = Thread(voice, THREADS_RESPONSE['thread'][0])
+        thread.mark_spam()
+        values = json.loads(responses.calls[-1].request.body)[0][0][0]
+        assert values == ['t.+12085550000', None, 1]  # index 2 = spam
+
+    def test_delete_not_implemented(self, voice):
+        with pytest.raises(NotImplementedError):
+            voice.delete('+12085550000')
+
+
+class TestDownload:
+    @responses.activate
+    def test_download_saves_audio(self, voice, tmp_path):
+        responses.post(API_BASE + 'api2thread/list', json=VOICEMAIL_THREAD)
+        responses.get('https://example.test/vm1.mp3', body=b'ID3audio')
+        vm = voice.voicemails()[0]
+        path = vm.download(str(tmp_path))
+        assert path.endswith('vm1.mp3')
+        assert (tmp_path / 'vm1.mp3').read_bytes() == b'ID3audio'
+
+    @responses.activate
+    def test_download_without_audio_raises(self, voice):
+        from googlevoice.util import DownloadError
+
+        responses.post(API_BASE + 'api2thread/list', json=THREADS_RESPONSE)
+        msg = voice.inbox()[0].latest  # an SMS, no audio
+        with pytest.raises(DownloadError):
+            msg.download()
+
+
+class TestSearch:
+    @responses.activate
+    def test_search_body_and_parse(self, voice):
+        responses.post(API_BASE + 'api2thread/search', json=THREADS_RESPONSE)
+        results = voice.search('hello', count=50)
+        assert len(results) == 1
+        body = json.loads(responses.calls[-1].request.body)
+        assert body[0] == 'hello' and body[1] == 50
+
+
 class TestProfileLock:
     @pytest.mark.skipif(bl.fcntl is None, reason='POSIX advisory locks only')
     def test_busy_profile_raises(self, tmp_path):
         held = bl.ProfileLock(tmp_path)
         held.acquire()
         try:
-            with pytest.raises(bl.BrowserBusyError):
+            with pytest.raises(bl.BrowserBusyError) as exc:
                 bl.ProfileLock(tmp_path).acquire()  # same profile, already locked
+            assert str(os.getpid()) in str(exc.value)  # error names the holder
         finally:
             held.release()
         # released -> can acquire again
@@ -214,3 +404,257 @@ class TestCLI:
         data = json.loads(capsys.readouterr().out)
         assert data[0]['id'] == 't.+12085550000'
         assert data[0]['messages'][0]['text'] == 'hello there'
+
+
+# --------------------------------------------------------------------------- #
+# Browser session helpers -- exercised against fakes standing in for nodriver's
+# Tab/Browser (real CDP command objects, no Chrome).
+# --------------------------------------------------------------------------- #
+VOICE_URL = 'https://voice.google.com/u/0/messages'
+SIGNED_OUT_URL = 'https://workspace.google.com/products/voice/'
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _browser_cookie(name, domain='.google.com', expires=-1, **extra):
+    """A stand-in for ``cdp.network.Cookie`` as ``browser.cookies.get_all()`` yields."""
+    base = {
+        'name': name,
+        'value': f'{name}-val',
+        'domain': domain,
+        'path': '/',
+        'secure': True,
+        'http_only': True,
+        'same_site': None,
+        'expires': expires,
+    }
+    base.update(extra)
+    return types.SimpleNamespace(**base)
+
+
+class FakeTab:
+    """Records the CDP commands sent and the navigations made."""
+
+    def __init__(self, urls=()):
+        self.urls = list(urls)  # what settled_url should report, in order
+        self.sent = []  # decoded CDP requests ({'method', 'params'})
+        self.gets = []
+
+    async def send(self, cmd):
+        request = next(cmd)  # a CDP command is a generator yielding its request
+        self.sent.append(request)
+        try:
+            cmd.send({'success': True})
+        except StopIteration as stop:
+            return stop.value
+        return None
+
+    async def get(self, url):
+        self.gets.append(url)
+
+    def params(self, method):
+        return [r['params'] for r in self.sent if r['method'] == method]
+
+
+class FakeBrowser:
+    def __init__(self, cookies=(), *, close_ok=True):
+        self._cookies = list(cookies)
+        self.cookies = types.SimpleNamespace(get_all=self._get_all)
+        self.close_ok = close_ok
+        self.stopped = False
+        self.closed = False
+        self.sent = []
+        self._process = types.SimpleNamespace(wait=self._wait)
+        self._process_pid = 4242
+
+    async def _get_all(self):
+        return self._cookies
+
+    async def _wait(self):
+        return 0
+
+    async def send(self, cmd):
+        if not self.close_ok:
+            raise ConnectionError('CDP gone')
+        self.sent.append(next(cmd))
+
+    async def aclose(self):
+        self.closed = True
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.fixture
+def scripted_urls(monkeypatch):
+    """Make ``settled_url`` report the tab's scripted URLs instead of polling."""
+
+    async def fake_settled(tab, **_):
+        return tab.urls.pop(0) if len(tab.urls) > 1 else tab.urls[0]
+
+    monkeypatch.setattr(auth, 'settled_url', fake_settled)
+
+
+class TestBrowserSession:
+    @pytest.mark.parametrize(
+        ('url', 'expected'),
+        [
+            (VOICE_URL, True),
+            ('https://voice.google.com/', True),
+            ('https://voice.google.com/about', False),
+            ('https://voice.google.com/about/', False),
+            (SIGNED_OUT_URL, False),
+            ('https://accounts.google.com/v3/signin/identifier?x=1', False),
+            ('', False),
+            (None, False),
+        ],
+    )
+    def test_is_signed_in_url(self, url, expected):
+        assert auth.is_signed_in_url(url) is expected
+
+    def test_settled_url_waits_out_redirects(self):
+        states = iter([
+            'loading https://voice.google.com/',
+            'complete https://voice.google.com/',
+            'complete https://accounts.google.com/x',
+            'complete https://accounts.google.com/x',
+            'complete never-reached',
+        ])
+        tab = types.SimpleNamespace()
+
+        async def evaluate(expr, await_promise=False):
+            return next(states)
+
+        tab.evaluate = evaluate
+        assert _run(auth.settled_url(tab, poll=0)) == 'https://accounts.google.com/x'
+
+    def test_inject_cookies_pins_session_cookies_and_skips_expired(self):
+        now = time.time()
+        cookies = [
+            # session cookie on a domain -> pinned with an expiry, Domain kept
+            {'name': 'SID', 'value': 's', 'domain': '.google.com', 'expires': -1},
+            # persistent -> expiry preserved
+            {
+                'name': 'NID',
+                'value': 'n',
+                'domain': '.google.com',
+                'path': '/',
+                'expires': now + 100,
+                'same_site': 'None',
+                'secure': True,
+            },
+            # host-only -> set via URL, no Domain attribute (``__Host-`` rule)
+            {
+                'name': '__Host-GAPS',
+                'value': 'g',
+                'domain': 'accounts.google.com',
+                'path': '/',
+                'expires': None,
+            },
+            # already expired -> skipped entirely
+            {'name': 'OLD', 'value': 'o', 'domain': '.google.com', 'expires': now - 5},
+        ]
+        tab = FakeTab()
+        assert _run(auth.inject_cookies(tab, cookies, ttl=1000)) == 3
+        by_name = {p['name']: p for p in tab.params('Network.setCookie')}
+        assert set(by_name) == {'SID', 'NID', '__Host-GAPS'}
+        assert by_name['SID']['domain'] == '.google.com'
+        assert now + 900 < float(by_name['SID']['expires']) <= now + 1100
+        assert float(by_name['NID']['expires']) == pytest.approx(now + 100)
+        assert by_name['NID']['sameSite'] == 'None'
+        assert 'domain' not in by_name['__Host-GAPS']
+        assert by_name['__Host-GAPS']['url'] == 'https://accounts.google.com/'
+        assert float(by_name['__Host-GAPS']['expires']) > now
+
+    def test_ensure_signed_in_uses_profile_when_already_signed_in(
+        self, scripted_urls, tmp_path
+    ):
+        tab = FakeTab([VOICE_URL])
+        landed = _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=tmp_path))
+        assert landed == VOICE_URL
+        assert tab.sent == [] and tab.gets == []
+
+    def test_ensure_signed_in_injects_saved_session_and_reloads(
+        self, scripted_urls, tmp_path
+    ):
+        session = save_session(FAKE_COOKIES, tmp_path / 'session.json')
+        tab = FakeTab([SIGNED_OUT_URL, VOICE_URL])
+        landed = _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=session))
+        assert landed == VOICE_URL
+        assert tab.gets == [auth.ORIGIN]  # reloaded after injecting
+        names = {p['name'] for p in tab.params('Network.setCookie')}
+        assert names == {c['name'] for c in FAKE_COOKIES}
+
+    def test_ensure_signed_in_without_session_file(self, scripted_urls, tmp_path):
+        tab = FakeTab([SIGNED_OUT_URL])
+        with pytest.raises(LoginError, match='googlevoice login'):
+            _run(
+                auth.ensure_signed_in(
+                    FakeBrowser(), tab, session_path=tmp_path / 'missing.json'
+                )
+            )
+        assert tab.gets == []
+
+    def test_ensure_signed_in_when_saved_session_is_dead(self, scripted_urls, tmp_path):
+        session = save_session(FAKE_COOKIES, tmp_path / 'session.json')
+        tab = FakeTab([SIGNED_OUT_URL, SIGNED_OUT_URL])
+        with pytest.raises(LoginError, match='no longer works'):
+            _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=session))
+
+    def test_ensure_signed_in_profile_only_mode(self, scripted_urls, tmp_path):
+        tab = FakeTab([SIGNED_OUT_URL])
+        with pytest.raises(LoginError):
+            _run(auth.ensure_signed_in(FakeBrowser(), tab, session_path=None))
+        assert tab.sent == []
+
+    def test_harvest_keeps_google_cookies_only(self):
+        browser = FakeBrowser([
+            _browser_cookie('SID'),
+            _browser_cookie('other', domain='.example.com'),
+            _browser_cookie('__Host-GAPS', domain='accounts.google.com', expires=5.0),
+        ])
+        got = _run(auth.harvest_cookies(browser))
+        assert [c['name'] for c in got] == ['SID', '__Host-GAPS']
+        assert got[0]['expires'] == -1 and got[0]['http_only'] is True
+        assert got[1]['domain'] == 'accounts.google.com'
+
+    def test_refresh_session_requires_essential_cookies(self, tmp_path):
+        path = tmp_path / 'session.json'
+        partial = FakeBrowser([_browser_cookie('SID')])
+        assert _run(auth.refresh_session(partial, path)) is False
+        assert not path.exists()
+        full = FakeBrowser([_browser_cookie(n) for n in auth.ESSENTIAL_COOKIES])
+        assert _run(auth.refresh_session(full, path)) is True
+        assert {c['name'] for c in load_session(path)} == auth.ESSENTIAL_COOKIES
+
+    def test_close_browser_prefers_graceful_close(self):
+        browser = FakeBrowser()
+        _run(auth.close_browser(browser))
+        assert browser.sent[0]['method'] == 'Browser.close'
+        assert browser.closed and not browser.stopped
+        assert browser._process is None
+
+    def test_close_browser_falls_back_to_stop(self):
+        browser = FakeBrowser(close_ok=False)
+        _run(auth.close_browser(browser))
+        assert browser.stopped
+
+    def test_sender_close_refreshes_session_then_quits(self, tmp_path):
+        from googlevoice.browser import BrowserSender
+
+        path = tmp_path / 'session.json'
+        sender = BrowserSender(tmp_path / 'profile', session_path=path)
+        sender._loop = asyncio.new_event_loop()
+        sender._browser = FakeBrowser([
+            _browser_cookie(n) for n in auth.ESSENTIAL_COOKIES
+        ])
+        sender._tab = object()
+        sender._signed_in = True
+        browser = sender._browser
+        sender.close()
+        assert sender._browser is None and sender._tab is None
+        assert path.exists()  # rotated cookies saved for next time
+        assert browser.sent[0]['method'] == 'Browser.close'
+        sender._loop.close()

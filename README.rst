@@ -93,17 +93,42 @@ Usage
     for msg in reversed(convo.messages):       # oldest first
         print(msg.start_time, msg.text)
 
-The command line mirrors this (``python -m googlevoice inbox``,
-``... thread NUMBER -n 100``), and ``number``/``inbox``/``thread`` take
-``--json`` for scripting.
+Voicemails (transcript in ``text``, audio via ``download``), call history, and
+full-text search are reads too:
 
-Point at a non-default session file with
+.. code-block:: python
+
+    for vm in voice.voicemails():
+        print(vm.start_time, vm.text)       # transcript
+        vm.download('.')                     # save the .mp3
+
+    voice.missed(); voice.placed(); voice.received()   # call records
+    voice.search('invoice')                            # matching conversations
+
+Managing a conversation is also a plain HTTP call (no browser): archive, spam,
+block and read all work on a thread, a number, or a thread id. There is no
+Trash -- in the modern web app, deletion is permanent.
+
+.. code-block:: python
+
+    convo.archive(); convo.unarchive()
+    convo.mark_spam(); convo.mark_not_spam()
+    convo.block(); convo.unblock()
+    convo.mark_read(False)                   # mark unread
+
+The command line mirrors all of this (``python -m googlevoice inbox``,
+``voicemail``, ``calls --type missed``, ``search QUERY``,
+``archive NUMBER`` ...); reading commands take ``--json`` for scripting.
+
+If the saved session expires, a 401 triggers a one-time browser re-login that
+auto-confirms from the saved profile and retries; disable with
+``Voice(auto_login=False)``. Point at a non-default session file with
 ``Voice(session_path='/path/to/session.json')`` or pass
 ``Voice(credentials=...)`` (see ``googlevoice.auth.Credentials``).
 
 Sending an SMS is gated by Google behind anti-abuse tokens (reCAPTCHA +
 BotGuard) that can only be produced in a browser, so it is done by driving the
-real web app (which reuses the profile from ``login``):
+real web app:
 
 .. code-block:: python
 
@@ -111,8 +136,15 @@ real web app (which reuses the profile from ``login``):
 
     with BrowserSender() as sender:
         sender.send_sms('+12085551234', 'Hello from Python!')
+        sender.send_sms(['+12085551234', '+12085550000'], 'Group hello!')
 
-Or from the command line: ``python -m googlevoice send +12085551234 "hi"``.
+Or from the command line: ``python -m googlevoice send +12085551234 "hi"``
+(comma-separate the numbers for a group message).
+
+The browser signs in from your saved ``session.json``, so it works on any
+machine that has the session file and Chrome, and never asks you to log in
+again while the session is valid. It also refreshes ``session.json`` when it
+closes.
 
 
 How it works

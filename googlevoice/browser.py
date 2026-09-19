@@ -17,22 +17,34 @@ Usage::
     with BrowserSender() as sender:           # reuses ~/.googlevoice/chrome-profile
         sender.send_sms('+12085551234', 'Hello from Python!')
 
-The profile must already be signed in -- run ``python -m googlevoice.auth
-login`` once first. Sending therefore needs Chrome installed and running;
-reading does not.
+Sign in once with ``python -m googlevoice login``. The browser signs in from
+the saved ``session.json`` whenever its profile has been signed out (Chrome
+drops the login cookies on a clean exit), and refreshes that file on close.
+Sending therefore needs Chrome installed and running; reading does not.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from ._browserlock import BrowserBusyError, ProfileLock
-from .auth import DEFAULT_PROFILE_DIR, ORIGIN
-from .util import APIError, LoginError
+from .auth import (
+    DEFAULT_DIR,
+    DEFAULT_PROFILE_DIR,
+    DEFAULT_SESSION_PATH,
+    ORIGIN,
+    browser_launch_args,
+    close_browser,
+    ensure_signed_in,
+    headless_default,
+    refresh_session,
+)
+from .util import APIError
 from .voice import normalize_number
 
 # Re-exported so callers can ``from googlevoice.browser import BrowserBusyError``.
-__all__ = ['BrowserSender', 'BrowserBusyError']
+__all__ = ['BrowserBusyError', 'BrowserSender', 'capture_api_calls']
 
 log = logging.getLogger(__name__)
 
@@ -71,20 +83,26 @@ window.__gv = (function () {
 class BrowserSender:
     """
     Sends Google Voice SMS by driving the real web app in a Chrome instance
-    (via ``nodriver``). Reuses the signed-in profile created by
-    ``python -m googlevoice.auth login``.
+    (via ``nodriver``). Reuses the profile created by ``python -m googlevoice
+    login`` and, when that profile has been signed out, signs in again from the
+    saved ``session_path`` (``None`` disables this and requires a signed-in
+    profile).
     """
 
     def __init__(
         self,
         profile_dir=DEFAULT_PROFILE_DIR,
         *,
-        headless: bool = False,
+        session_path=DEFAULT_SESSION_PATH,
+        headless: bool | None = None,
         timeout: float = 60,
         wait: bool = False,
     ):
         self.profile_dir = profile_dir
-        self.headless = headless
+        self.session_path = session_path
+        # headless=None -> auto: headed if a display is available, else headless
+        # (a headed Chrome can't start on a display-less server/container).
+        self.headless = headless_default() if headless is None else headless
         self.timeout = timeout
         # wait=False -> raise BrowserBusyError if the profile is already in use;
         # wait=True -> queue until it frees up.
@@ -93,6 +111,7 @@ class BrowserSender:
         self._tab = None
         self._loop = None
         self._lock = None
+        self._signed_in = False
         self._statuses: list[int] = []
 
     # ------------------------------------------------------------------ #
@@ -126,7 +145,7 @@ class BrowserSender:
         self._browser = await uc.start(
             headless=self.headless,
             user_data_dir=str(self.profile_dir),
-            browser_args=['--no-first-run', '--no-default-browser-check'],
+            browser_args=browser_launch_args(),
         )
         self._tab = await self._browser.get(ORIGIN)
 
@@ -136,42 +155,58 @@ class BrowserSender:
 
         self._tab.add_handler(cdp.network.ResponseReceived, _on_response)
         await self._tab.send(cdp.network.enable())
-        await self._sleep(4)
 
-        url = await self._tab.evaluate('location.href', await_promise=False)
-        if 'voice.google.com' not in (url or '') or 'workspace.google.com' in (
-            url or ''
-        ):
-            raise LoginError(
-                'Browser profile is not signed in to Google Voice. '
-                'Run `python -m googlevoice.auth login` first.'
-            )
+        # Signed-out profile -> sign in from session.json; raises LoginError
+        # if neither works.
+        await ensure_signed_in(self._browser, self._tab, session_path=self.session_path)
+        self._signed_in = True
 
     def close(self) -> None:
         if self._browser is not None:
-            self._browser.stop()
-            self._browser = self._tab = None
+            browser, self._browser, self._tab = self._browser, None, None
+            try:
+                self._loop.run_until_complete(self._shutdown(browser))
+            except Exception as err:  # noqa: BLE001 - teardown must not mask the real error
+                log.debug('graceful shutdown failed (%s); terminating', err)
+                with contextlib.suppress(Exception):
+                    browser.stop()
         if self._lock is not None:
             self._lock.release()
             self._lock = None
+
+    async def _shutdown(self, browser) -> None:
+        # Keep the portable session current with Google's rotated cookies, then
+        # let Chrome quit cleanly so the profile is written out.
+        if self._signed_in and self.session_path is not None:
+            with contextlib.suppress(Exception):
+                await refresh_session(browser, self.session_path)
+        await close_browser(browser)
 
     # ------------------------------------------------------------------ #
     # sending
     # ------------------------------------------------------------------ #
     def send_sms(
-        self, recipient: str, text: str, *, thread_id: str | None = None
+        self, recipient: str | list[str], text: str, *, thread_id: str | None = None
     ) -> None:
         """
-        Send ``text`` to ``recipient`` (E.164, e.g. ``+12085551234``) by driving
-        the web app's "new message" composer, which routes correctly for both
-        new and existing conversations. ``thread_id`` is accepted for API
-        symmetry with :meth:`googlevoice.Voice.send_sms` but is not needed here.
+        Send ``text`` by driving the web app's "new message" composer, which
+        routes correctly for both new and existing conversations.
+
+        ``recipient`` may be a single number (E.164, e.g. ``+12085551234``) or a
+        list/comma-separated string of numbers -- pass more than one to start a
+        **group message**. ``thread_id`` is accepted for API symmetry with
+        :meth:`googlevoice.Voice.send_sms` but is not needed here.
         """
         if self._browser is None:
             raise RuntimeError(
                 'BrowserSender not started; use it as a context manager.'
             )
-        self._loop.run_until_complete(self._send(normalize_number(recipient), text))
+        if isinstance(recipient, str):
+            recipient = recipient.split(',')
+        recipients = [normalize_number(r) for r in recipient if r.strip()]
+        if not recipients:
+            raise APIError('No recipient given.')
+        self._loop.run_until_complete(self._send(recipients, text))
 
     async def _type(self, text: str) -> None:
         """Type ``text`` into the focused element with real (trusted) keystrokes."""
@@ -203,7 +238,7 @@ class BrowserSender:
         """Evaluate ``expr``; reinstall the JS helpers and retry once if needed."""
         try:
             return await self._tab.evaluate(expr, await_promise=False)
-        except Exception:
+        except Exception:  # noqa: BLE001 - a navigation wipes the helpers; reinstall
             await self._tab.evaluate(_HELPERS_JS, await_promise=False)
             return await self._tab.evaluate(expr, await_promise=False)
 
@@ -217,7 +252,22 @@ class BrowserSender:
             await self._sleep(delay)
         return res
 
-    async def _send(self, recipient: str, text: str) -> None:
+    async def _add_recipient(self, number: str) -> None:
+        """Type one number into the recipient field and pick its suggestion."""
+        # The Material autocomplete only opens its "Send to <number>" suggestion
+        # in response to genuine key events, not a synthetic value set.
+        if await self._poll("window.__gv.focus('Type a name or phone number')") != 'OK':
+            raise APIError('Could not find the recipient field.')
+        await self._type(number)
+        await self._sleep(1.5)  # let the autocomplete populate
+        if await self._poll("window.__gv.clickClass('send-to-label')") != 'OK':
+            raise APIError(
+                f'No "Send to {number}" suggestion appeared; '
+                'is the number valid and textable?'
+            )
+        await self._sleep(1)
+
+    async def _send(self, recipients: list[str], text: str) -> None:
         before = len(self._statuses)
         await self._browser.get(f'{ORIGIN}/u/0/messages')
         await self._sleep(5)
@@ -228,22 +278,11 @@ class BrowserSender:
             raise APIError('Could not open the new-message composer.')
         await self._sleep(1)
 
-        # 2. focus the recipient field and type with REAL keystrokes -- the
-        #    Material autocomplete only opens its "Send to <number>" suggestion
-        #    in response to genuine key events, not a synthetic value set.
-        if await self._poll("window.__gv.focus('Type a name or phone number')") != 'OK':
-            raise APIError('Could not find the recipient field.')
-        await self._type(recipient)
-        await self._sleep(1.5)  # let the autocomplete populate
-        # 3. pick the "Send to <number>" suggestion
-        if await self._poll("window.__gv.clickClass('send-to-label')") != 'OK':
-            raise APIError(
-                f'No "Send to {recipient}" suggestion appeared; '
-                'is the number valid and textable?'
-            )
-        await self._sleep(1)
+        # 2. add each recipient in turn (>1 number => a group message)
+        for number in recipients:
+            await self._add_recipient(number)
 
-        # 4. focus the compose box, type the message with real keystrokes, and
+        # 3. focus the compose box, type the message with real keystrokes, and
         #    press Enter to send (the new-message composer sends on Enter).
         if await self._poll("window.__gv.focus('Type a message')") != 'OK':
             raise APIError('Could not find the compose box.')
@@ -251,13 +290,13 @@ class BrowserSender:
         await self._sleep(0.5)
         await self._press_enter()
 
-        # 5. confirm the send actually went through
+        # 4. confirm the send actually went through
         for _ in range(int(self.timeout * 2)):
             await self._sleep(0.5)
             if len(self._statuses) > before:
                 status = self._statuses[-1]
                 if status == 200:
-                    log.info('sent to %s', recipient)
+                    log.info('sent to %s', ', '.join(recipients))
                     return
                 raise APIError(f'sendsms returned HTTP {status}')
         raise APIError('Timed out waiting for the message to send.')
@@ -266,3 +305,162 @@ class BrowserSender:
         import asyncio
 
         await asyncio.sleep(seconds)
+
+
+DEFAULT_CAPTURE_PATH = DEFAULT_DIR / 'capture.jsonl'
+
+
+def capture_api_calls(
+    profile_dir=DEFAULT_PROFILE_DIR,
+    *,
+    seconds: float = 180,
+    headless: bool | None = None,
+    wait: bool = False,
+    out_path=DEFAULT_CAPTURE_PATH,
+) -> list[dict]:
+    """
+    Open the signed-in web app and record every ``voiceclient`` POST (endpoint
+    and decoded body) for ``seconds`` while you drive it by hand.
+
+    This is the maintenance tool used to reverse-engineer the endpoints in
+    :mod:`googlevoice.voice`; rerun it if Google changes the web API.  Perform
+    an action in the browser and read the captured ``endpoint  body`` to update
+    the relevant constant (``Folder``, ``MessageType``, the ``_Attr`` indices
+    for ``thread/batchupdateattributes``, or ``_MEDIA_URL_KEYS``).  Each request
+    is **written immediately** (one JSON object per line) to ``out_path`` *and*
+    printed; writing+flushing per line means the log survives buffering or a
+    killed process -- you can ``tail -f`` it live.
+
+    Returns the captured calls as ``[{'endpoint', 'url', 'body'}, ...]``.
+    """
+    import nodriver as uc
+
+    if headless is None:
+        headless = headless_default()
+    lock = ProfileLock(profile_dir, wait=wait)
+    lock.acquire()
+    try:
+        return uc.loop().run_until_complete(
+            _capture_async(
+                profile_dir, seconds=seconds, headless=headless, out_path=out_path
+            )
+        )
+    finally:
+        lock.release()
+
+
+async def _capture_async(profile_dir, *, seconds, headless, out_path) -> list[dict]:
+    import asyncio
+    import json
+    import pathlib
+
+    import nodriver as uc
+    from nodriver import cdp
+
+    out_path = pathlib.Path(out_path).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sink = out_path.open('w', encoding='utf-8')
+
+    calls: list[dict] = []
+    browser = await uc.start(
+        headless=headless,
+        user_data_dir=str(profile_dir),
+        # keep cross-origin iframes in the page process so their requests surface
+        # on the page target rather than a separate one we'd miss.
+        browser_args=[
+            *browser_launch_args(),
+            '--disable-features=IsolateOrigins,site-per-process',
+        ],
+    )
+    try:
+        tab = await browser.get(ORIGIN)
+
+        static_ext = (
+            '.js',
+            '.css',
+            '.png',
+            '.jpg',
+            '.jpeg',
+            '.gif',
+            '.svg',
+            '.woff',
+            '.woff2',
+            '.ico',
+            '.webp',
+            '.map',
+        )
+
+        def _on_request(ev):
+            req = ev.request
+            url = req.url or ''
+            path = url.split('?', 1)[0].lower()
+            if path.endswith(static_ext):
+                return  # static asset
+            if any(
+                s in url
+                for s in (
+                    'gstatic.com',
+                    'google-analytics.com',
+                    '/gen_204',
+                    '/jserror',
+                    '/ulog',
+                    'play.google.com/log',
+                )
+            ):
+                return  # telemetry / analytics
+            # Keep every POST (writes can go to any host / RPC), plus GETs that
+            # look like API calls -- so we catch whichever mechanism each action
+            # uses, even a worker or a non-clients6 host.
+            api_like = any(
+                s in url for s in ('voiceclient', 'api2thread', '/voice/', '/$rpc/')
+            )
+            if req.method != 'POST' and not api_like:
+                return
+            if 'voiceclient/' in url:
+                endpoint = url.split('voiceclient/', 1)[1].split('?', 1)[0]
+            else:
+                endpoint = f'{req.method} ' + url.split('//', 1)[-1].split('?', 1)[0]
+            raw = req.post_data
+            try:
+                body = json.loads(raw) if raw else None
+            except (ValueError, TypeError):
+                body = raw
+            rec = {'endpoint': endpoint, 'url': req.url, 'body': body}
+            calls.append(rec)
+            sink.write(json.dumps(rec) + '\n')
+            sink.flush()  # the log is the source of truth -- survive kill/buffering
+            print(f'  {endpoint}\n    {json.dumps(body)}', flush=True)
+
+        tab.add_handler(cdp.network.RequestWillBeSent, _on_request)
+        # max_post_data_size makes Chrome include request bodies inline in the
+        # event (otherwise post_data is None for non-trivial bodies).
+        await tab.send(cdp.network.enable(max_post_data_size=1 << 20))
+
+        # Attach to any other targets too (extra tabs, web/service workers) so a
+        # request a worker issues is captured, not just the main page's.
+        for other in list(getattr(browser, 'targets', [])):
+            if other is tab:
+                continue
+            try:
+                other.add_handler(cdp.network.RequestWillBeSent, _on_request)
+                await other.send(cdp.network.enable(max_post_data_size=1 << 20))
+            except Exception as err:  # noqa: BLE001 - not all targets support Network
+                log.debug('skip target %s: %s', other, err)
+
+        # A signed-out profile records nothing useful; sign in from session.json.
+        await ensure_signed_in(browser, tab)
+
+        print(
+            f'>>> Recording voiceclient calls to {out_path} for {seconds:.0f}s.',
+            flush=True,
+        )
+        print(
+            '>>> In the browser: archive / spam / block / delete / search / play voicemail.',
+            flush=True,
+        )
+        await asyncio.sleep(seconds)
+    finally:
+        await close_browser(browser)
+        sink.close()
+    print(f'>>> Captured {len(calls)} call(s).', flush=True)
+    return calls
