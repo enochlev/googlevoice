@@ -53,7 +53,10 @@ class _Player:
 
     async def _play_once(self) -> None:
         self._proc = await asyncio.create_subprocess_exec(
-            'pw-play', '--target', self.mic_sink, self.wav,
+            'pw-play',
+            '--target',
+            self.mic_sink,
+            self.wav,
             stderr=asyncio.subprocess.DEVNULL,
         )
         await self._proc.wait()
@@ -78,7 +81,9 @@ def place_say_call(
 
     Returns the call outcome (see :meth:`googlevoice.call.Caller.place_call`).
     """
-    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    # Only the name is wanted here: the TTS helper opens and writes the file
+    # itself, so a context manager does not fit. The ``finally`` removes it.
+    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)  # noqa: SIM115
     tmp.close()
     try:
         audio.tts_to_wav(say, tmp.name, voice=voice, lead_silence=lead_silence)
@@ -90,7 +95,9 @@ def place_say_call(
                 init_script=MIC_CONSTRAINTS_JS,
             ) as caller:
                 return caller.place_call(
-                    number, wait_for_answer=True, ring_timeout=ring_timeout,
+                    number,
+                    wait_for_answer=True,
+                    ring_timeout=ring_timeout,
                     on_connected=_Player(tmp.name),
                 )
         finally:

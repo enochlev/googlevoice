@@ -72,7 +72,9 @@ def tts_to_wav(
             "`pip install 'googlevoice[tts]'`"
         ) from exc
 
-    tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+    # Only the name is wanted here: edge-tts opens and writes the file itself,
+    # so a context manager does not fit. The ``finally`` below removes it.
+    tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)  # noqa: SIM115
     tmp.close()
     try:
 

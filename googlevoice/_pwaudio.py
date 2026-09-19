@@ -48,19 +48,21 @@ MIC_CONSTRAINTS_JS = r"""
 
 
 def _run(cmd: list[str]) -> str:
-    return subprocess.run(cmd, capture_output=True, text=True).stdout
+    return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout
 
 
 def create_null_sink(name: str) -> None:
     """Create a persistent null sink named ``name``."""
-    _run(
-        [
-            'pw-cli', 'create-node', 'adapter',
+    _run([
+        'pw-cli',
+        'create-node',
+        'adapter',
+        (
             f'{{ factory.name=support.null-audio-sink node.name={name} '
             f'node.description={name} media.class=Audio/Sink '
-            f'object.linger=true audio.position=[FL FR] }}',
-        ]
-    )
+            f'object.linger=true audio.position=[FL FR] }}'
+        ),
+    ])
 
 
 def destroy_sink(name: str) -> None:

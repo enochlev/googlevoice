@@ -184,21 +184,44 @@ class RealtimeBridge:
 
         # RX: capture the caller's voice (gv_spk monitor) as raw pcm16/24k mono.
         rec = await asyncio.create_subprocess_exec(
-            'pw-record', '-P', 'stream.capture.sink=true', '--target', self.spk_sink,
-            '--rate', str(RATE), '--channels', '1', '--format', 's16', '-',
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            'pw-record',
+            '-P',
+            'stream.capture.sink=true',
+            '--target',
+            self.spk_sink,
+            '--rate',
+            str(RATE),
+            '--channels',
+            '1',
+            '--format',
+            's16',
+            '-',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         # TX: play the agent's voice into gv_mic (low latency for snappy barge-in).
         play = await asyncio.create_subprocess_exec(
-            'pw-play', '--target', self.mic_sink, '--rate', str(RATE),
-            '--channels', '1', '--format', 's16', '--latency', '80ms', '-',
-            stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            'pw-play',
+            '--target',
+            self.mic_sink,
+            '--rate',
+            str(RATE),
+            '--channels',
+            '1',
+            '--format',
+            's16',
+            '--latency',
+            '80ms',
+            '-',
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
 
         url = f'{OPENAI_REALTIME_URL}?model={self.model}'
         log.info('connecting to OpenAI Realtime (%s)', self.model)
         async with websockets.connect(
-            url, additional_headers={'Authorization': f'Bearer {self.key}'},
+            url,
+            additional_headers={'Authorization': f'Bearer {self.key}'},
             max_size=None,
         ) as ws:
             await ws.send(json.dumps(self._session_update()))
@@ -256,12 +279,10 @@ class RealtimeBridge:
                 if not chunk:
                     break
                 await ws.send(
-                    json.dumps(
-                        {
-                            'type': 'input_audio_buffer.append',
-                            'audio': base64.b64encode(chunk).decode(),
-                        }
-                    )
+                    json.dumps({
+                        'type': 'input_audio_buffer.append',
+                        'audio': base64.b64encode(chunk).decode(),
+                    })
                 )
         except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
             if not isinstance(exc, asyncio.CancelledError):
@@ -341,32 +362,28 @@ class RealtimeBridge:
             call_id = ev.get('call_id')
             if call_id:
                 await ws.send(
-                    json.dumps(
-                        {
-                            'type': 'conversation.item.create',
-                            'item': {
-                                'type': 'function_call_output',
-                                'call_id': call_id,
-                                'output': json.dumps({'ok': False, 'still_need': need}),
-                            },
-                        }
-                    )
+                    json.dumps({
+                        'type': 'conversation.item.create',
+                        'item': {
+                            'type': 'function_call_output',
+                            'call_id': call_id,
+                            'output': json.dumps({'ok': False, 'still_need': need}),
+                        },
+                    })
                 )
             await ws.send(
-                json.dumps(
-                    {
-                        'type': 'response.create',
-                        'response': {
-                            'instructions': (
-                                f"Do NOT hang up yet -- you still need {need}. Stay "
-                                'warm, upbeat and playful, keep the conversation '
-                                'going, and work toward it. Only use end_call once '
-                                'you genuinely have both; use abort_call only if they '
-                                'are truly upset or insist on going.'
-                            )
-                        },
-                    }
-                )
+                json.dumps({
+                    'type': 'response.create',
+                    'response': {
+                        'instructions': (
+                            f"Do NOT hang up yet -- you still need {need}. Stay "
+                            'warm, upbeat and playful, keep the conversation '
+                            'going, and work toward it. Only use end_call once '
+                            'you genuinely have both; use abort_call only if they '
+                            'are truly upset or insist on going.'
+                        )
+                    },
+                })
             )
             return
         log.info('agent ended the call (rating=%s, friends=%s)', rating, friends)
@@ -475,7 +492,9 @@ def place_realtime_call(
             init_script=MIC_CONSTRAINTS_JS,
         ) as caller:
             outcome = caller.place_call(
-                number, wait_for_answer=True, ring_timeout=ring_timeout,
+                number,
+                wait_for_answer=True,
+                ring_timeout=ring_timeout,
                 on_connected=bridge,
             )
     except Exception as exc:  # noqa: BLE001 -- still summarize what happened
@@ -485,9 +504,7 @@ def place_realtime_call(
         destroy_sink('gv_spk')
 
     try:
-        summary = summarize_call(
-            goal, bridge.transcript, model=summary_model, key=key
-        )
+        summary = summarize_call(goal, bridge.transcript, model=summary_model, key=key)
         print(f'\n=== Post-call summary ({summary_model}) ===\n{summary}\n')
     except Exception as exc:  # noqa: BLE001
         log.warning('post-call summary failed: %r', exc)

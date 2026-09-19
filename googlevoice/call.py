@@ -142,6 +142,7 @@ class Caller:
 
     def start(self) -> None:
         import nodriver as uc
+
         # One Chrome per profile: take the lock (clearing any stale one) first.
         self._lock = ProfileLock(self.profile_dir, wait=self.wait)
         self._lock.acquire()
@@ -156,7 +157,11 @@ class Caller:
         import nodriver as uc
         from nodriver import cdp
 
-        args = ['--no-first-run', '--no-default-browser-check', *self.extra_browser_args]
+        args = [
+            '--no-first-run',
+            '--no-default-browser-check',
+            *self.extra_browser_args,
+        ]
         self._browser = await uc.start(
             headless=self.headless,
             user_data_dir=str(self.profile_dir),
@@ -367,9 +372,9 @@ class Caller:
         if await self._poll(f"window.__gv.clickAria({label!r})", tries=6) == 'OK':
             return True
         # fallback: any action whose label contains the spaced number
-        if await self._poll(f"window.__gv.clickAriaLike({spaced!r})", tries=4) == 'OK':
-            return True
-        return False
+        return (
+            await self._poll(f"window.__gv.clickAriaLike({spaced!r})", tries=4) == 'OK'
+        )
 
     # ------------------------------------------------------------------ #
     # call-state machine (read from the "Call panel" DOM)
@@ -424,7 +429,10 @@ class Caller:
         # vanished call panel turn teardown into a crash.
         try:
             for sub in ('end call', 'hang up'):
-                if await self._poll(f"window.__gv.clickAriaLike({sub!r})", tries=3) == 'OK':
+                if (
+                    await self._poll(f"window.__gv.clickAriaLike({sub!r})", tries=3)
+                    == 'OK'
+                ):
                     break
             log.info('hung up')
         except Exception as exc:  # noqa: BLE001
@@ -441,7 +449,8 @@ class Caller:
         """Evaluate ``expr``; reinstall the JS helpers and retry once if needed."""
         try:
             return await self._tab.evaluate(expr, await_promise=False)
-        except Exception:
+        except Exception:  # noqa: BLE001 - any CDP/page error means the helpers
+            # were lost (navigation, reload); reinstall them and try once more.
             await self._install_helpers()
             return await self._tab.evaluate(expr, await_promise=False)
 
