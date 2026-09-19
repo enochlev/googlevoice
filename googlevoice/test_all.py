@@ -545,6 +545,12 @@ class FakeBrowser:
 
 
 @pytest.fixture
+def nodriver():
+    """The CDP command objects come from nodriver, which CI does not install."""
+    return pytest.importorskip('nodriver')
+
+
+@pytest.fixture
 def scripted_urls(monkeypatch):
     """Make ``settled_url`` report the tab's scripted URLs instead of polling."""
 
@@ -587,7 +593,7 @@ class TestBrowserSession:
         tab.evaluate = evaluate
         assert _run(auth.settled_url(tab, poll=0)) == 'https://accounts.google.com/x'
 
-    def test_inject_cookies_pins_session_cookies_and_skips_expired(self):
+    def test_inject_cookies_pins_session_cookies_and_skips_expired(self, nodriver):
         now = time.time()
         cookies = [
             # session cookie on a domain -> pinned with an expiry, Domain kept
@@ -634,7 +640,7 @@ class TestBrowserSession:
         assert tab.sent == [] and tab.gets == []
 
     def test_ensure_signed_in_injects_saved_session_and_reloads(
-        self, scripted_urls, tmp_path
+        self, nodriver, scripted_urls, tmp_path
     ):
         session = save_session(FAKE_COOKIES, tmp_path / 'session.json')
         tab = FakeTab([SIGNED_OUT_URL, VOICE_URL])
@@ -654,7 +660,9 @@ class TestBrowserSession:
             )
         assert tab.gets == []
 
-    def test_ensure_signed_in_when_saved_session_is_dead(self, scripted_urls, tmp_path):
+    def test_ensure_signed_in_when_saved_session_is_dead(
+        self, nodriver, scripted_urls, tmp_path
+    ):
         session = save_session(FAKE_COOKIES, tmp_path / 'session.json')
         tab = FakeTab([SIGNED_OUT_URL, SIGNED_OUT_URL])
         with pytest.raises(LoginError, match='no longer works'):
@@ -686,19 +694,19 @@ class TestBrowserSession:
         assert _run(auth.refresh_session(full, path)) is True
         assert {c['name'] for c in load_session(path)} == auth.ESSENTIAL_COOKIES
 
-    def test_close_browser_prefers_graceful_close(self):
+    def test_close_browser_prefers_graceful_close(self, nodriver):
         browser = FakeBrowser()
         _run(auth.close_browser(browser))
         assert browser.sent[0]['method'] == 'Browser.close'
         assert browser.closed and not browser.stopped
         assert browser._process is None
 
-    def test_close_browser_falls_back_to_stop(self):
+    def test_close_browser_falls_back_to_stop(self, nodriver):
         browser = FakeBrowser(close_ok=False)
         _run(auth.close_browser(browser))
         assert browser.stopped
 
-    def test_sender_close_refreshes_session_then_quits(self, tmp_path):
+    def test_sender_close_refreshes_session_then_quits(self, nodriver, tmp_path):
         from googlevoice.browser import BrowserSender
 
         path = tmp_path / 'session.json'
